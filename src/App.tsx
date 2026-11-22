@@ -2074,6 +2074,30 @@ export default function App() {
         }),
       });
 
+      if (!response.ok) {
+        let serverMessage = '';
+        try {
+          const text = await response.text();
+          try {
+            const parsed = JSON.parse(text);
+            serverMessage = typeof parsed?.error === 'string' ? parsed.error : (parsed?.detail || parsed?.message || '');
+          } catch {
+            serverMessage = '';
+          }
+        } catch {
+          serverMessage = '';
+        }
+        if (response.status === 404) {
+          throw new Error('Analysis backend not found (HTTP 404). This deployment only hosts the frontend: the Python analysis server (FastAPI + FFmpeg) must run separately and /api must be routed to it.');
+        }
+        throw new Error(serverMessage || `Analysis server responded with HTTP ${response.status}. Please try again.`);
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('text/event-stream')) {
+        throw new Error(`Analysis server returned an unexpected response (${contentType || 'unknown content type'}) instead of a progress stream. Check that /api is routed to the Python analysis backend.`);
+      }
+
       if (!response.body) throw new Error('No response stream from server.');
 
       const reader = response.body.getReader();

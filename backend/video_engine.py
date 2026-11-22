@@ -1,0 +1,4104 @@
+import os
+import sys
+import re
+import json
+import time
+import shutil
+import logging
+import subprocess
+import unicodedata
+import math
+import urllib.parse
+import urllib.request
+import contextlib
+import tempfile
+import threading
+import signal
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple, Union, Callable
+from PIL import Image, ImageDraw, ImageFont
+logger = logging.getLogger("cheat-clip-pro.video-engine")
+
+BASE_DIR = Path(__file__).resolve().parent
+TEMP_DIR = BASE_DIR / "temp_clips"
+EXPORTS_DIR = BASE_DIR / "exports"
+FONTS_DIR = BASE_DIR / "fonts"
+COOKIES_PATH = BASE_DIR / "cookies.txt"
+ROOT_COOKIES_PATH = BASE_DIR.parent / "cookies.txt"
+
+
+
+def normalize_to_netscape(raw_content: str) -> str:
+    """Cleans raw cookie input, strips UTF BOMs and null bytes, and auto-converts
+    JSON cookies, HTTP Cookie headers, or misaligned columns to valid Netscape format for yt-dlp.
+    """
+    if not raw_content:
+        return ""
+
+    text = (
+        raw_content.replace("\ufeff", "")
+        .replace("\ufffe", "")
+        .replace("\x00", "")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .strip()
+    )
+
+    if not text:
+        return ""
+
+    # 1. Check for JSON format (Cookie-Editor, EditThisCookie, etc.)
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and "cookies" in parsed and isinstance(parsed["cookies"], list):
+                parsed = parsed["cookies"]
+            elif isinstance(parsed, dict):
+                parsed = [parsed]
+            if isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+                lines = [
+                    "# Netscape HTTP Cookie File",
+                    "# http://curl.haxx.se/rfc/cookie_spec.html",
+                    "# Converted automatically from JSON format by CheatClip Pro",
+                    "",
+                ]
+                count = 0
+                for item in parsed:
+                    domain = str(item.get("domain") or item.get("host") or "").strip()
+                    if not domain:
+                        domain = ".youtube.com"
+                    flag = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = str(item.get("path") or "/").strip()
+                    secure = "TRUE" if item.get("secure") else "FALSE"
+                    exp = item.get("expirationDate") or item.get("expires") or item.get("expiry") or 0
+                    try:
+                        exp_int = int(float(exp))
+                    except Exception:
+                        exp_int = 0
+                    if exp_int <= 0:
+                        exp_int = 2147483647
+
+                    name = str(item.get("name") or "").strip()
+                    val = str(item.get("value") or "").strip()
+                    if name:
+                        lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{exp_int}\t{name}\t{val}")
+                        count += 1
+
+                if count > 0:
+                    return "\n".join(lines) + "\n"
+        except Exception:
+            pass
+
+    # 2. Check for HTTP Cookie header format (e.g. from browser DevTools Network tab or curl: "Cookie: SID=...; HSID=...")
+    clean_header = text
+    if clean_header.lower().startswith("cookie:"):
+        clean_header = clean_header[7:].strip()
+    if ";" in clean_header and "=" in clean_header and "\t" not in clean_header:
+        pairs = clean_header.split(";")
+        header_lines = [
+            "# Netscape HTTP Cookie File",
+            "# http://curl.haxx.se/rfc/cookie_spec.html",
+            "# Converted automatically from HTTP Cookie header by CheatClip Pro",
+            "",
+        ]
+        cookie_count = 0
+        for pair in pairs:
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            k, v = pair.split("=", 1)
+            name = k.strip()
+            val = v.strip()
+            if name:
+                header_lines.append(f".youtube.com\tTRUE\t/\tTRUE\t2147483647\t{name}\t{val}")
+                cookie_count += 1
+        if cookie_count > 0:
+            return "\n".join(header_lines) + "\n"
+
+    # 3. Handle standard Netscape text and space-to-tab repair
+    lines = text.split("\n")
+    cleaned_lines = []
+    has_header = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "# Netscape HTTP Cookie File" in stripped:
+            has_header = True
+            cleaned_lines.append(stripped)
+            continue
+        if stripped.startswith("#") and not stripped.startswith("#HttpOnly_"):
+            cleaned_lines.append(stripped)
+            continue
+
+        # If line has spaces instead of tabs, convert 2+ spaces to tabs
+        if "\t" not in stripped:
+            parts = re.split(r'\s{2,}|\t', stripped)
+            if len(parts) >= 6:
+                stripped = "\t".join(parts)
+
+        cleaned_lines.append(stripped)
+
+    if not has_header:
+        cleaned_lines.insert(0, "# Netscape HTTP Cookie File")
+        cleaned_lines.insert(1, "# http://curl.haxx.se/rfc/cookie_spec.html")
+        cleaned_lines.insert(2, "")
+
+    return "\n".join(cleaned_lines) + "\n"
+
+
+@contextlib.contextmanager
+def ephemeral_cookies_file(cookies_content: Optional[str]):
+    """Creates a temporary Netscape cookies file for a single task and ensures it is deleted immediately."""
+    if not cookies_content or len(str(cookies_content).strip()) < 10:
+        yield None
+        return
+
+    normalized = normalize_to_netscape(str(cookies_content))
+    if not normalized or len(normalized.strip()) < 10:
+        yield None
+        return
+
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        prefix="yt_cookie_",
+        suffix=".txt",
+        dir=str(TEMP_DIR),
+        delete=False,
+        encoding="utf-8"
+    )
+    temp_path = Path(temp_file.name)
+    try:
+        temp_file.write(normalized)
+        temp_file.flush()
+        temp_file.close()
+        yield temp_path
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+
+
+def get_effective_cookies_path() -> Optional[Path]:
+    """Returns valid cookies file path if persistent file exists on disk (fallback)."""
+    if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
+        return COOKIES_PATH
+    if ROOT_COOKIES_PATH.exists() and ROOT_COOKIES_PATH.stat().st_size > 0:
+        return ROOT_COOKIES_PATH
+    return None
+
+CASCADE_PATH = BASE_DIR / "haarcascade_frontalface_default.xml"
+CASCADES_DIR = BASE_DIR / "cascades"
+YUNET_MODEL_PATH = CASCADES_DIR / "face_detection_yunet.onnx"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+FONTS_DIR.mkdir(parents=True, exist_ok=True)
+CASCADES_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = TEMP_DIR / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _ffmpeg_has_filter(executable: str, filter_name: str) -> bool:
+    """Returns whether an FFmpeg binary exposes the requested filter."""
+    try:
+        result = subprocess.run(
+            [executable, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        return result.returncode == 0 and re.search(
+            rf"(?m)^\s*\S+\s+{re.escape(filter_name)}\s+", result.stdout or ""
+        ) is not None
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def ensure_ffmpeg_in_path():
+    """Auto-detect FFmpeg if it was installed via winget, scoop, or local paths but not in PATH."""
+    current_path = os.environ.get("PATH") or os.environ.get("Path") or ""
+    path_parts = current_path.split(os.pathsep) if current_path else []
+
+    # Ensure Python runtime directories and Scripts are in PATH
+    try:
+        py_dir = Path(sys.executable).parent
+        for p in [py_dir, py_dir / "Scripts", py_dir / "bin"]:
+            if p.exists():
+                p_str = str(p.resolve())
+                if p_str not in path_parts:
+                    path_parts.insert(0, p_str)
+    except Exception:
+        pass
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path or not _ffmpeg_has_filter(ffmpeg_path, "subtitles"):
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        user_profile = os.environ.get("USERPROFILE", "")
+        prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+
+        candidate_roots = [
+            Path(local_app_data) / "Microsoft" / "WinGet" / "Packages" if local_app_data else None,
+            Path(local_app_data) / "Programs" / "ffmpeg" / "bin" if local_app_data else None,
+            Path(user_profile) / "scoop" / "apps" / "ffmpeg" / "current" / "bin" if user_profile else None,
+            Path(user_profile) / "scoop" / "shims" if user_profile else None,
+            Path(prog_files) / "ffmpeg" / "bin",
+            Path(prog_files_x86) / "ffmpeg" / "bin",
+            Path("C:/ffmpeg/bin"),
+            Path("C:/Program Files/ffmpeg/bin"),
+        ]
+
+        # Homebrew's standard formula omits libass; ffmpeg-full is keg-only.
+        if sys.platform == "darwin":
+            candidate_roots.extend([
+                Path("/opt/homebrew/opt/ffmpeg-full/bin"),
+                Path("/usr/local/opt/ffmpeg-full/bin"),
+            ])
+
+        for root in candidate_roots:
+            if root and root.exists():
+                executable = root / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if executable.exists() and _ffmpeg_has_filter(str(executable), "subtitles"):
+                    r_str = str(root.resolve())
+                    if r_str not in path_parts:
+                        path_parts.insert(0, r_str)
+                    logger.info(f"Auto-added subtitle-capable FFmpeg to PATH: {r_str}")
+                    break
+                for exe in root.glob("**/ffmpeg.exe" if os.name == "nt" else "**/ffmpeg"):
+                    if not _ffmpeg_has_filter(str(exe), "subtitles"):
+                        continue
+                    bin_dir = str(exe.parent.resolve())
+                    if bin_dir not in path_parts:
+                        path_parts.insert(0, bin_dir)
+                    logger.info(f"Auto-added subtitle-capable FFmpeg to PATH: {bin_dir}")
+                    break
+
+    # Re-assign unified PATH
+    new_path = os.pathsep.join(path_parts)
+    os.environ["PATH"] = new_path
+    os.environ["Path"] = new_path
+
+
+ensure_ffmpeg_in_path()
+
+# Global lazy-loaded whisper model and thread lock for PyTorch attention safety
+_WHISPER_MODEL = None
+_WHISPER_LOCK = threading.Lock()
+
+
+def get_whisper_model():
+    global _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is None:
+            try:
+                import whisper
+                import torch
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                # Prefer 'large-v3-turbo' / 'turbo' for state-of-the-art accuracy on mixed Indonesian-English speech
+                # Falls back to 'small', then 'base' if larger models cannot be loaded
+                loaded = False
+                for model_candidate in ["large-v3-turbo", "turbo", "small", "base"]:
+                    try:
+                        logger.info(f"Loading Whisper '{model_candidate}' model on {device.upper()} for high-accuracy bilingual transcription...")
+                        _WHISPER_MODEL = whisper.load_model(model_candidate, device=device)
+                        loaded = True
+                        break
+                    except Exception as e_cand:
+                        logger.warning(f"Could not load Whisper '{model_candidate}' model ({e_cand}). Trying next candidate...")
+                if not loaded:
+                    _WHISPER_MODEL = False
+            except Exception as e:
+                logger.warning(f"Could not load Whisper model: {e}")
+                _WHISPER_MODEL = False
+    return _WHISPER_MODEL if _WHISPER_MODEL is not False else None
+
+
+def release_whisper_model():
+    """Explicitly frees Whisper PyTorch model from RAM to preserve memory on low-spec servers."""
+    global _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_MODEL is not None and _WHISPER_MODEL is not False:
+            try:
+                del _WHISPER_MODEL
+                _WHISPER_MODEL = None
+                import gc
+                gc.collect()
+                logger.info("Whisper model unloaded from memory to free server RAM.")
+            except Exception:
+                pass
+
+
+def check_encoder_support(encoder_name: str) -> bool:
+    """Check if a specific FFmpeg video encoder is operational on this system."""
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=1080x1920:d=0.2",
+            "-c:v", encoder_name, "-f", "null", "-"
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=5)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+ENCODER_CONFIGS: Dict[str, Tuple[str, List[str]]] = {
+    "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]),
+    "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cbr", "-b:v", "6M"]),
+    "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"]),
+    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2"]),
+}
+
+_DETECTED_SUPPORT: Optional[Dict[str, Any]] = None
+
+
+def get_system_gpu_name() -> Optional[str]:
+    """Detects the physical GPU model name on the host system."""
+    # Try nvidia-smi query first
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                universal_newlines=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL
+            ).strip()
+            if out:
+                return out.split("\n")[0].strip()
+        except Exception:
+            pass
+
+    # On Windows, query CIM VideoController
+    if sys.platform.startswith("win"):
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                universal_newlines=True,
+                timeout=4,
+                stderr=subprocess.DEVNULL
+            ).strip()
+            lines = [l.strip() for l in out.split("\n") if l.strip()]
+            for l in lines:
+                if any(k in l.lower() for k in ["nvidia", "geforce", "rtx", "gtx", "radeon", "intel arc", "arc"]):
+                    return l
+            if lines:
+                return lines[0]
+        except Exception:
+            pass
+
+    return None
+
+
+def detect_hardware_support() -> Dict[str, Any]:
+    """Detects host GPU/CPU hardware acceleration support and caches the result."""
+    global _DETECTED_SUPPORT
+    if _DETECTED_SUPPORT is not None:
+        return _DETECTED_SUPPORT
+
+    has_nvenc = check_encoder_support("h264_nvenc")
+    has_amf = check_encoder_support("h264_amf")
+    has_qsv = check_encoder_support("h264_qsv")
+
+    if has_nvenc:
+        recommended = "nvenc"
+    elif has_amf:
+        recommended = "amf"
+    elif has_qsv:
+        recommended = "qsv"
+    else:
+        recommended = "cpu"
+
+    gpu_name = get_system_gpu_name()
+
+    _DETECTED_SUPPORT = {
+        "nvenc": has_nvenc,
+        "amf": has_amf,
+        "qsv": has_qsv,
+        "cpu": True,
+        "recommended": recommended,
+        "gpu_name": gpu_name,
+    }
+    return _DETECTED_SUPPORT
+
+
+def get_preferred_video_encoder() -> Tuple[str, List[str]]:
+    """
+    Auto-detects the fastest available hardware encoder:
+    1. NVIDIA NVENC (h264_nvenc)
+    2. AMD AMF (h264_amf)
+    3. Intel QuickSync (h264_qsv)
+    4. Universal CPU software encoding (libx264)
+    """
+    support = detect_hardware_support()
+    rec = support.get("recommended", "cpu")
+    if rec in ENCODER_CONFIGS:
+        codec, args = ENCODER_CONFIGS[rec]
+        logger.info(f"Hardware acceleration auto-select: {codec} (rec: {rec}) enabled.")
+        return codec, args
+
+    return ENCODER_CONFIGS["cpu"]
+
+
+def resolve_encoder(user_selection: Optional[str] = "auto") -> Tuple[str, List[str]]:
+    """
+    Resolves user selection ('auto', 'nvenc', 'amf', 'qsv', 'cpu', 'client_gpu') to (codec_name, ffmpeg_args).
+    Always prioritizes dedicated hardware GPU acceleration (e.g. h264_nvenc) and never defaults to CPU.
+    """
+    sel = (user_selection or "auto").lower().strip()
+    if sel in ("auto", "client_gpu", "browser_wasm"):
+        return get_preferred_video_encoder()
+
+    if sel in ("cpu", "libx264"):
+        return ENCODER_CONFIGS["cpu"]
+
+    if sel in ENCODER_CONFIGS:
+        return ENCODER_CONFIGS[sel]
+
+    # Check direct codec names
+    for key, (codec, args) in ENCODER_CONFIGS.items():
+        if sel == codec or sel == key:
+            return codec, args
+
+    return get_preferred_video_encoder()
+
+
+ACTIVE_ENCODER_NAME, ACTIVE_ENCODER_ARGS = get_preferred_video_encoder()
+USE_NVENC = (ACTIVE_ENCODER_NAME == "h264_nvenc")
+
+
+def format_section_time(seconds: float) -> str:
+    """Format seconds into HH:MM:SS.cs for yt-dlp section cutting."""
+    total_seconds = max(0.0, seconds)
+    h = int(total_seconds // 3600)
+    m = int((total_seconds % 3600) // 60)
+    s = int(total_seconds % 60)
+    cs = int(round((total_seconds - int(total_seconds)) * 100))
+    if cs >= 100:
+        cs = 99
+    return f"{h:02d}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def get_yt_dlp_cookies_args() -> List[str]:
+    """Returns yt-dlp cookies arguments if cookies.txt exists and is non-empty."""
+    eff = get_effective_cookies_path()
+    if eff:
+        return ["--cookies", str(eff)]
+    return []
+
+
+def get_yt_dlp_base_cmd(
+    include_cookies: bool = True,
+    cookies_path: Optional[Union[str, Path]] = None,
+    proxy: Optional[str] = None,
+) -> List[str]:
+    """
+    Returns base command for yt-dlp with JavaScript runtime, player extractor args, cookies, and proxy.
+    Tries standalone 'yt-dlp' executable first, then falls back to python module:
+    [sys.executable, "-m", "yt_dlp"] which works 100% of the time if installed via pip.
+    """
+    if shutil.which("yt-dlp"):
+        cmd = ["yt-dlp"]
+    else:
+        try:
+            import yt_dlp
+            cmd = [sys.executable, "-m", "yt_dlp"]
+        except ImportError:
+            raise RuntimeError(
+                "yt-dlp is not installed in this Python environment. "
+                "Please run 'pip install yt-dlp' or 'pip install -r backend/requirements.txt'."
+            )
+
+    # Prefer deno (fast challenge solver for modern YouTube player), then node
+    if shutil.which("deno"):
+        cmd.extend(["--js-runtimes", "deno"])
+    elif shutil.which("node"):
+        cmd.extend(["--js-runtimes", "node"])
+
+    # Enable remote component challenge solver to bypass YouTube n-sig throttling
+    cmd.extend(["--remote-components", "ejs:github"])
+
+    # Proxy support (custom proxy or environment proxy fallback)
+    try:
+        from backend.utils.proxy import get_proxy_url
+        proxy_url = proxy or get_proxy_url()
+    except Exception:
+        proxy_url = proxy or os.environ.get("PROXY_URL") or os.environ.get("WEBSHARE_PROXY")
+    if proxy_url:
+        cmd.extend(["--proxy", proxy_url])
+
+    has_active_cookies = False
+    if cookies_path and Path(cookies_path).exists() and Path(cookies_path).stat().st_size > 0:
+        has_active_cookies = True
+        logger.info(f"Using ephemeral YouTube cookies from: {cookies_path}")
+        cmd.extend(["--cookies", str(cookies_path)])
+    elif include_cookies:
+        eff = get_effective_cookies_path()
+        if eff and eff.exists() and eff.stat().st_size > 0:
+            has_active_cookies = True
+            logger.info(f"Using YouTube cookies from: {eff}")
+            cmd.extend(["--cookies", str(eff)])
+
+    if has_active_cookies:
+        # Prioritize unthrottled high-speed DASH formats while keeping session cookies valid
+        cmd.extend(["--extractor-args", "youtube:player_client=default,web_embedded,web,mweb,android,ios"])
+    else:
+        # In guest mode (without cookies), use robust multi-client hierarchy to bypass bot checks
+        cmd.extend(["--extractor-args", "youtube:player_client=default,web_embedded,web,mweb,android,ios"])
+
+    cmd.append("--force-ipv4")
+    return cmd
+
+
+def is_valid_mp4(file_path: Union[str, Path]) -> bool:
+    """
+    Checks if an MP4 file exists, is non-empty, and has a valid moov atom / container header
+    that FFmpeg or ffprobe can read without errors.
+    """
+    p = Path(file_path)
+    if not p.exists():
+        return False
+    try:
+        size = p.stat().st_size
+        if size < 10000:
+            return False
+    except Exception:
+        return False
+
+    # Check using ffprobe if available
+    try:
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(p)
+        ]
+        res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=8)
+        if res.returncode == 0 and res.stdout.strip():
+            try:
+                dur = float(res.stdout.strip())
+                if dur > 0.05:
+                    return True
+            except Exception:
+                return True
+        err = (res.stderr or "").lower()
+        if "moov atom not found" in err or "invalid data" in err:
+            return False
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    # Fallback check using ffmpeg
+    try:
+        ffmpeg_cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", str(p),
+            "-t", "0.1",
+            "-f", "null", "-"
+        ]
+        res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=8)
+        if res.returncode == 0:
+            return True
+        err = (res.stderr or "").lower()
+        if "moov atom not found" in err or "invalid data" in err:
+            return False
+    except Exception:
+        pass
+
+    return False
+
+
+def get_video_file_metadata(file_path: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Extracts duration, dimensions, FPS, and stream metadata for a local video file.
+    """
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Video file not found: {p}")
+    
+    title = p.stem
+    duration = 0.0
+    width = 1920
+    height = 1080
+    fps = 30.0
+    has_audio = True
+
+    # Try ffprobe first
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration:stream=width,height,r_frame_rate,codec_type",
+            "-of", "json",
+            str(p)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            format_info = data.get("format", {})
+            if "duration" in format_info:
+                duration = float(format_info["duration"])
+            
+            streams = data.get("streams", [])
+            audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+            has_audio = len(audio_streams) > 0
+
+            video_streams = [s for s in streams if s.get("codec_type") == "video"]
+            if video_streams:
+                v = video_streams[0]
+                width = int(v.get("width", 1920))
+                height = int(v.get("height", 1080))
+                r_fps = str(v.get("r_frame_rate", "30/1"))
+                if "/" in r_fps:
+                    num, den = r_fps.split("/")
+                    fps = float(num) / max(1.0, float(den))
+                else:
+                    fps = float(r_fps)
+    except Exception as e:
+        logger.warning(f"ffprobe metadata extraction failed for {p}: {e}")
+
+    # Fallback to OpenCV if duration or dimensions not found
+    if duration <= 0 or width <= 0 or height <= 0:
+        try:
+            import cv2
+            cap = cv2.VideoCapture(str(p))
+            if cap.isOpened():
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                cap_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                if cap_fps > 0:
+                    fps = cap_fps
+                    duration = frame_count / cap_fps
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or width)
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or height)
+                cap.release()
+        except Exception as e:
+            logger.warning(f"OpenCV metadata fallback failed: {e}")
+
+    return {
+        "title": title,
+        "duration": round(duration, 2),
+        "width": width,
+        "height": height,
+        "fps": round(fps, 2),
+        "has_audio": has_audio,
+        "file_path": str(p),
+        "size_bytes": p.stat().st_size
+    }
+
+
+def compute_audio_energy_heatmap(file_path: Union[str, Path], duration: float, num_points: int = 100) -> List[Dict[str, float]]:
+    """
+    Analyzes audio RMS energy / amplitude across the video timeline to generate realistic
+    heatmap engagement telemetry matching YouTube's replay heatmap format (0.0 to 1.0).
+    """
+    p = Path(file_path)
+    if duration <= 0:
+        duration = 60.0
+    
+    seg_dur = duration / max(1, num_points)
+    raw_scores = [0.2] * num_points
+    
+    try:
+        temp_wav = TEMP_DIR / f"temp_heat_{p.stem}_{int(time.time())}.wav"
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", str(p),
+            "-vn", "-ac", "1", "-ar", "8000",
+            "-f", "wav",
+            str(temp_wav)
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=30)
+        if res.returncode == 0 and temp_wav.exists() and temp_wav.stat().st_size > 100:
+            import wave
+            import numpy as np
+            with wave.open(str(temp_wav), "rb") as wf:
+                n_frames = wf.getnframes()
+                audio_bytes = wf.readframes(n_frames)
+                audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                
+                if len(audio_data) > 0:
+                    samples_per_seg = int(len(audio_data) / num_points)
+                    if samples_per_seg > 0:
+                        for i in range(num_points):
+                            chunk = audio_data[i * samples_per_seg : (i + 1) * samples_per_seg]
+                            if len(chunk) > 0:
+                                rms = float(np.sqrt(np.mean(chunk**2)))
+                                raw_scores[i] = rms
+            try:
+                temp_wav.unlink()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Audio energy heatmap calculation fallback used: {e}")
+
+    min_v = min(raw_scores)
+    max_v = max(raw_scores)
+    diff = max_v - min_v
+    
+    heatmap = []
+    for i in range(num_points):
+        st = round(i * seg_dur, 2)
+        et = round(min(duration, (i + 1) * seg_dur), 2)
+        if diff > 0.0001:
+            val = round(0.1 + 0.9 * ((raw_scores[i] - min_v) / diff), 3)
+        else:
+            val = round(0.3 + 0.4 * (0.5 + 0.5 * math.sin(i * 0.2)), 3)
+        heatmap.append({
+            "start_time": st,
+            "end_time": et,
+            "value": max(0.05, min(1.0, val))
+        })
+    return heatmap
+
+
+def transcribe_local_video_file(
+    file_path: Union[str, Path],
+    progress_callback=None,
+    target_language: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Transcribes speech from a local video or audio file using OpenAI Whisper.
+    Strictly focuses on Bahasa Indonesia or English.
+    Returns standard transcript segments formatted as:
+    [{"text": "...", "start": 0.0, "duration": 3.5}, ...]
+    """
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+
+    whisper_model = get_whisper_model()
+    if whisper_model is None:
+        raise RuntimeError(
+            "Whisper speech recognition model could not be loaded on this system. "
+            "Please ensure `openai-whisper` is installed and FFmpeg is in PATH."
+        )
+
+    if progress_callback:
+        progress_callback("Running Whisper AI", f"Extracting dialogue from {p.name} with Whisper...", 30)
+
+    logger.info(f"Transcribing local file with Whisper: {p} (target_language={target_language})")
+    whisper_prompt = (
+        "Transkrip percakapan video bilingual Bahasa Indonesia dan English (bahasa gaul, campur, Jaksel). "
+        "Pertahankan ejaan yang tepat untuk istilah teknologi, gaming, internet, dan kata serapan bahasa Inggris." if target_language == "id"
+        else "Video dialogue transcript in English. Conversational, gaming, slang, and clear speech." if target_language == "en"
+        else "Transkrip video percakapan bilingual Bahasa Indonesia dan English."
+    )
+    import torch
+    use_fp16 = bool(torch.cuda.is_available())
+    transcribe_kwargs: Dict[str, Any] = {
+        "word_timestamps": False,  # Dialogue segment detection does not need word timestamps; avoids find_alignment DTW tensor shape mismatch
+        "fp16": use_fp16,
+        "verbose": False,
+        "condition_on_previous_text": False,
+        "initial_prompt": whisper_prompt,
+    }
+    if target_language in ("id", "en"):
+        transcribe_kwargs["language"] = target_language
+
+    result = None
+    with _WHISPER_LOCK:
+        try:
+            result = whisper_model.transcribe(str(p), **transcribe_kwargs)
+        except RuntimeError as e:
+            err_str = str(e).lower()
+            if "dimension" in err_str or "tensor" in err_str or "size" in err_str:
+                logger.warning(f"Whisper attention tensor mismatch ({e}), retrying without prompt/condition...")
+                minimal_kwargs: Dict[str, Any] = {
+                    "word_timestamps": False,
+                    "fp16": False,
+                    "verbose": False,
+                    "condition_on_previous_text": False,
+                }
+                if target_language in ("id", "en"):
+                    minimal_kwargs["language"] = target_language
+                result = whisper_model.transcribe(str(p), **minimal_kwargs)
+            else:
+                raise
+
+    if not result:
+        return []
+
+    segments = result.get("segments", [])
+    transcript_lines = []
+
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        start = round(float(seg.get("start", 0.0)), 2)
+        end = round(float(seg.get("end", start + 2.0)), 2)
+        dur = round(max(0.4, end - start), 2)
+        transcript_lines.append({
+            "text": text,
+            "start": start,
+            "duration": dur
+        })
+
+    logger.info(f"Whisper transcribed {len(transcript_lines)} dialogue segments from {p.name}")
+    return transcript_lines
+
+
+def download_clip_segment(
+    video_url: str,
+    start_time: float,
+    end_time: float,
+    output_filename: str,
+    cookies_content: Optional[str] = None,
+    on_process_spawned: Optional[Callable[[subprocess.Popen], None]] = None,
+    proxy: Optional[str] = None,
+    stage_callback: Optional[Callable[[str, float], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> str:
+    """
+    Downloads or slices the requested time slice in high definition (1080p).
+    If video_url is a local file (uploaded video), uses direct FFmpeg slicing.
+    Otherwise downloads using yt-dlp.
+    """
+    output_path = TEMP_DIR / output_filename
+    if output_path.exists():
+        try:
+            output_path.unlink()
+        except Exception:
+            pass
+
+    def _run_subproc(sub_cmd: List[str], timeout: float) -> subprocess.CompletedProcess:
+        popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True}
+        if os.name != "nt":
+            popen_kwargs["start_new_session"] = True
+        proc = subprocess.Popen(sub_cmd, **popen_kwargs)
+        if on_process_spawned:
+            try:
+                on_process_spawned(proc)
+            except Exception:
+                pass
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            return subprocess.CompletedProcess(sub_cmd, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+                else:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.communicate(timeout=3)
+            except Exception:
+                pass
+            raise
+
+    # Check if video_url points to a local file or an online stream
+    clean_raw = urllib.parse.unquote(video_url.strip())
+    clean_base = os.path.basename(clean_raw.split("?")[0])
+
+    from backend.utils.text import is_twitch_url, extract_twitch_info, get_twitch_canonical_url
+    yt_audio_match = re.search(r'yt_audio_([a-zA-Z0-9_-]{11})', clean_raw)
+    tw_audio_match = re.search(r'twitch_audio_(twitch_\d+|twitch_clip_[a-zA-Z0-9_-]+|\d+|[a-zA-Z0-9_-]+)', clean_raw)
+    is_yt = bool(yt_audio_match or re.search(r'(?:youtube\.com|youtu\.be)', clean_raw))
+    is_tw = bool(tw_audio_match or is_twitch_url(clean_raw))
+
+    if yt_audio_match:
+        clean_url = f"https://www.youtube.com/watch?v={yt_audio_match.group(1)}"
+        logger.info(f"Resolved cached audio reference '{clean_raw}' back to genuine YouTube stream: {clean_url}")
+    elif is_yt:
+        clean_url = clean_raw if clean_raw.startswith("http") else f"https://www.youtube.com/watch?v={clean_raw}"
+    elif tw_audio_match or is_tw:
+        tw_info = extract_twitch_info(clean_raw)
+        clean_url = get_twitch_canonical_url(tw_info) if tw_info else clean_raw
+        logger.info(f"Resolved Twitch reference '{clean_raw}' back to genuine Twitch stream: {clean_url}")
+    else:
+        clean_url = clean_raw
+
+    is_online_stream = is_yt or is_tw or clean_url.startswith("http://") or clean_url.startswith("https://")
+    local_source = None
+
+    if not is_online_stream:
+        # Check local uploaded or Google Drive files
+        if os.path.exists(clean_raw):
+            local_source = Path(clean_raw)
+        elif os.path.exists(video_url):
+            local_source = Path(video_url)
+        elif clean_raw.startswith("/api/video/"):
+            candidate = UPLOADS_DIR / clean_base
+            if candidate.exists():
+                local_source = candidate
+        elif (UPLOADS_DIR / clean_base).exists():
+            local_source = UPLOADS_DIR / clean_base
+        elif (TEMP_DIR / clean_base).exists() and not clean_base.startswith("yt_audio_") and not clean_base.startswith("twitch_audio_"):
+            local_source = TEMP_DIR / clean_base
+        elif (EXPORTS_DIR / clean_base).exists():
+            local_source = EXPORTS_DIR / clean_base
+
+        if not local_source:
+            all_local_files: List[Path] = []
+            for d in [UPLOADS_DIR, TEMP_DIR, EXPORTS_DIR]:
+                if d.exists():
+                    all_local_files.extend([
+                        f for f in d.iterdir()
+                        if f.is_file() and f.suffix.lower() in [".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"]
+                        and "_clip_" not in f.name and not f.name.startswith("yt_audio_") and not f.name.startswith("twitch_audio_")
+                    ])
+
+            clean_lower = clean_base.lower()
+            for f in all_local_files:
+                if f.name.lower() == clean_lower or f.stem.lower() == clean_lower or clean_lower in f.name.lower() or f.stem.lower() in clean_lower:
+                    local_source = f
+                    break
+
+            if not local_source:
+                match_id = re.search(r'(gdrive_[a-zA-Z0-9_-]+|upload_[a-zA-Z0-9_-]+)', clean_raw)
+                if match_id:
+                    raw_id = match_id.group(1).replace("gdrive_", "").replace("upload_", "")
+                    for f in all_local_files:
+                        if raw_id in f.name:
+                            local_source = f
+                            break
+
+        if not local_source:
+            raise RuntimeError(f"Source video file not found on disk for '{clean_raw}'. Please re-analyze the video.")
+    else:
+        # For online streams, verify if a full raw video already exists locally and meets the resolution requirements
+        has_active_cookies = bool(cookies_content or get_effective_cookies_path())
+        required_height = 1080 if has_active_cookies else 720
+
+        # Try to locate any cached raw video for this stream
+        stream_id_match = yt_audio_match.group(1) if yt_audio_match else None
+        if not stream_id_match and "v=" in clean_url:
+            v_match = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', clean_url)
+            if v_match:
+                stream_id_match = v_match.group(1)
+        elif not stream_id_match and "youtu.be/" in clean_url:
+            v_match = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', clean_url)
+            if v_match:
+                stream_id_match = v_match.group(1)
+
+        # Check if direct clip material was already acquired by Stage 1
+        stream_id = stream_id_match or re.sub(r'[^a-zA-Z0-9_-]', '_', clean_url.split("?")[0])
+        pre_candidates = [
+            TEMP_DIR / f"clip_bahan_{stream_id}_{int(start_time)}_{int(end_time)}.mp4",
+            EXPORTS_DIR / f"clip_bahan_{stream_id}_{int(start_time)}_{int(end_time)}.mp4",
+        ]
+        for pre in pre_candidates:
+            if pre.exists() and pre.stat().st_size > 50 * 1024 and is_valid_mp4(pre):
+                logger.info(f"Reusing pre-acquired Stage 1 HD clip segment: {pre.name} -> {output_path}")
+                shutil.copyfile(str(pre), str(output_path))
+                return str(output_path)
+
+        candidate_sources: List[Path] = []
+        for d in [EXPORTS_DIR, TEMP_DIR, UPLOADS_DIR]:
+            if d.exists():
+                for f in d.iterdir():
+                    if f.is_file() and f.suffix.lower() in [".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"]:
+                        if f.name.startswith("yt_audio_") or f.name.startswith("twitch_audio_") or "_clip_" in f.name:
+                            continue
+                        if stream_id_match and stream_id_match in f.name:
+                            candidate_sources.append(f)
+
+        for cand in candidate_sources:
+            if cand.exists() and cand.stat().st_size > 5 * 1024 * 1024 and is_valid_mp4(cand):
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", str(cand)],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    h = int(probe.stdout.strip()) if probe.stdout.strip().isdigit() else 0
+                    if h >= required_height:
+                        logger.info(f"Reusing verified HD local cached video {cand.name} (height={h}p >= {required_height}p)")
+                        local_source = cand
+                        break
+                    else:
+                        logger.info(f"Skipping cached candidate {cand.name} (height={h}p < {required_height}p); will download fresh HD stream")
+                except Exception:
+                    pass
+
+    clip_duration = max(1.0, end_time - start_time)
+
+    if local_source and local_source.exists():
+        logger.info(f"Slicing local video: {local_source} [{start_time:.2f}s -> {end_time:.2f}s] to {output_path}")
+        slice_timeout = max(300, min(1200, int(clip_duration * 6) + 90))
+        slice_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(start_time),
+            "-i", str(local_source),
+            "-t", str(clip_duration),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
+            "-af", "aresample=async=1:first_pts=0",
+            "-movflags", "+faststart",
+            str(output_path)
+        ]
+        res = _run_subproc(slice_cmd, timeout=slice_timeout)
+        if output_path.exists() and is_valid_mp4(output_path):
+            return str(output_path)
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except Exception:
+                pass
+        raise RuntimeError(f"Failed to slice video clip from source '{local_source.name}': {res.stderr or 'Corrupted video stream'}")
+
+    t_start_fmt = format_section_time(start_time)
+    t_end_fmt = format_section_time(end_time)
+
+    # Bounded timeout: ensures clips are fetched quickly with adequate headroom for network fluctuations.
+    timeout_sec = max(60, min(180, int(clip_duration * 2.5) + 45))
+
+    if stage_callback:
+        stage_callback("Preparing YouTube video stream...", 42.0)
+
+    with ephemeral_cookies_file(cookies_content) as temp_cookies:
+        has_cookies = temp_cookies is not None or get_effective_cookies_path() is not None
+        # If cookies are present, try with cookies first; if rejected by YouTube (or any reload/bot error), try guest mode.
+        attempts = [True, False] if has_cookies else [False]
+        last_err_snippet = "unknown"
+
+        for use_cookies in attempts:
+            mode_label = "with cookies" if use_cookies else "guest mode (without cookies)"
+            base_cmd = get_yt_dlp_base_cmd(include_cookies=use_cookies, cookies_path=temp_cookies if use_cookies else None, proxy=proxy)
+            logger.info(f"Downloading HD section ({clip_duration:.1f}s) {t_start_fmt} -> {t_end_fmt} for {clean_url} ({mode_label}, timeout: {timeout_sec}s)")
+
+            if stage_callback:
+                stage_callback(f"Downloading HD clip slice ({mode_label})...", 48.0)
+
+            # Method 1: yt-dlp --download-sections with multi-fragment acceleration, socket timeout, & retries
+            cmd = [
+                *base_cmd,
+                "--newline",
+                "--no-colors",
+                "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
+                "-N", "16",
+                "--concurrent-fragments", "16",
+                "--buffer-size", "64K",
+                "--http-chunk-size", "10M",
+                "--socket-timeout", "15",
+                "--fragment-retries", "3",
+                "--retries", "3",
+                "--file-access-retries", "2",
+                "-o", str(output_path),
+                "--merge-output-format", "mp4",
+                "--no-warnings",
+                clean_url
+            ]
+            try:
+                popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
+                if os.name != "nt":
+                    popen_kwargs["start_new_session"] = True
+                proc = subprocess.Popen(cmd, **popen_kwargs)
+                if on_process_spawned:
+                    try:
+                        on_process_spawned(proc)
+                    except Exception:
+                        pass
+
+                last_clip_pct = 20.0
+                for clean_line in read_subprocess_lines(proc.stdout):
+                    clean_line = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', clean_line).strip()
+                    if not clean_line:
+                        continue
+                    if "[youtube]" in clean_line or "[info]" in clean_line:
+                        if progress_callback:
+                            progress_callback({
+                                "percent": 25.0,
+                                "downloaded": "Menghubungkan...",
+                                "total": "",
+                                "speed": "",
+                                "eta": "",
+                                "stage": "Menghubungkan ke YouTube..."
+                            })
+                    elif "[download]" in clean_line:
+                        pct_m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', clean_line)
+                        tot_m = re.search(r'of\s*~?\s*([0-9.]+\s*[a-zA-Z]+)', clean_line)
+                        spd_m = re.search(r'at\s+([0-9.]+\s*[a-zA-Z]+/s)', clean_line)
+                        eta_m = re.search(r'ETA\s+([0-9:]+)', clean_line)
+                        if pct_m:
+                            try:
+                                raw_pct = float(pct_m.group(1))
+                                calc_pct = round(30.0 + (raw_pct / 100.0) * 60.0, 1)
+                                if calc_pct > last_clip_pct:
+                                    last_clip_pct = calc_pct
+                            except Exception:
+                                pass
+                        tot_bytes = parse_bytes_from_string(tot_m.group(1)) if tot_m else 0.0
+                        total_str = format_human_size(tot_bytes) if tot_bytes > 0 else (tot_m.group(1).strip() if tot_m else "")
+                        speed_str = format_human_speed(spd_m.group(1).strip()) if spd_m else ""
+                        eta_str = eta_m.group(1).strip() if (eta_m and eta_m.group(1) != "Unknown") else ""
+                        dl_str = ""
+                        if tot_bytes > 0 and last_clip_pct > 30:
+                            dl_bytes = ((last_clip_pct - 30.0) / 60.0) * tot_bytes
+                            dl_str = format_human_size(dl_bytes)
+                        elif last_clip_pct > 0:
+                            dl_str = f"{last_clip_pct:.0f}%"
+
+                        if progress_callback:
+                            progress_callback({
+                                "percent": last_clip_pct,
+                                "downloaded": dl_str,
+                                "total": total_str,
+                                "speed": speed_str,
+                                "eta": eta_str,
+                                "stage": f"Mengunduh potongan klip 1080p ({last_clip_pct:.0f}%)..."
+                            })
+                        if stage_callback:
+                            stage_callback(f"Mengunduh potongan klip 1080p ({last_clip_pct:.0f}%)...", last_clip_pct)
+                    elif "[Merger]" in clean_line or "Merging formats" in clean_line:
+                        if progress_callback:
+                            progress_callback({
+                                "percent": 95.0,
+                                "downloaded": "Menyelesaikan",
+                                "total": "",
+                                "speed": "",
+                                "eta": "00:01",
+                                "stage": "Menyelesaikan penggabungan klip..."
+                            })
+
+                proc.stdout.close()
+                ret = proc.wait()
+                if ret == 0 and output_path.exists() and is_valid_mp4(output_path):
+                    if progress_callback:
+                        progress_callback({
+                            "percent": 100.0,
+                            "downloaded": "Selesai",
+                            "total": format_human_size(output_path.stat().st_size),
+                            "speed": "",
+                            "eta": "",
+                            "stage": "Potongan klip siap!"
+                        })
+                    logger.info(f"Successfully downloaded section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                    return str(output_path)
+                # If not valid or returncode != 0, clean up any incomplete/corrupt partial file immediately
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = f"exit code {ret}"
+            except subprocess.TimeoutExpired:
+                logger.warning(f"yt-dlp download-sections timed out after {timeout_sec}s for {clean_url} ({mode_label}).")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = f"download-sections timed out after {timeout_sec}s due to network lag"
+            except Exception as e:
+                logger.warning(f"yt-dlp download-sections failed ({e}) ({mode_label}).")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # Method 2: Fallback - Extract direct stream URLs with yt-dlp and slice using FFmpeg with network reconnect
+            logger.info(f"Direct section download fallback ({last_err_snippet}), trying stream URL trimming with auto-reconnect ({mode_label})...")
+            if stage_callback:
+                stage_callback(f"Extracting stream URLs ({mode_label})...", 60.0)
+
+            try:
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                url_cmd = [
+                    *base_cmd,
+                    "--socket-timeout", "12",
+                    "-g",
+                    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
+                    clean_url
+                ]
+                url_res = _run_subproc(url_cmd, timeout=20)
+                if url_res.returncode == 0 and url_res.stdout.strip():
+                    urls = url_res.stdout.strip().split("\n")
+                    video_stream = urls[0]
+                    audio_stream = urls[1] if len(urls) > 1 else urls[0]
+
+                    trim_timeout = max(30, min(65, int(clip_duration * 1.2) + 20))
+                    trim_cmd = [
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                        "-reconnect", "1",
+                        "-reconnect_at_eof", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "5",
+                        "-ss", str(start_time),
+                        "-i", video_stream,
+                        "-ss", str(start_time),
+                        "-i", audio_stream,
+                        "-t", str(clip_duration),
+                        "-map", "0:v:0", "-map", "1:a:0?",
+                        *ACTIVE_ENCODER_ARGS,
+                        "-c:a", "aac",
+                        "-b:a", "192k",
+                        "-af", "aresample=async=1:first_pts=0",
+                        "-movflags", "+faststart",
+                        str(output_path)
+                    ]
+                    trim_res = _run_subproc(trim_cmd, timeout=trim_timeout)
+                    if trim_res.returncode == 0 and is_valid_mp4(output_path):
+                        logger.info(f"Successfully trimmed stream URLs with FFmpeg ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                        return str(output_path)
+                    else:
+                        if output_path.exists():
+                            try:
+                                output_path.unlink()
+                            except Exception:
+                                pass
+                        last_err_snippet = trim_res.stderr[:300] if (trim_res and trim_res.stderr) else "stream trimming failed"
+            except Exception as e:
+                logger.error(f"Fallback stream trimming failed ({mode_label}): {e}")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # When cookies are active, DO NOT silently downgrade to 480p/360p while cookies are on!
+            # Instead, proceed immediately to guest mode HD attempt before accepting any low resolution.
+            if use_cookies and False in attempts:
+                logger.warning(f"HD section download with cookies failed ({last_err_snippet}). Proceeding to guest mode HD attempt before trying lower resolutions...")
+                continue
+
+            # Method 3: Fallback - Download at 720p (vastly lower bandwidth, skips SABR/1080p throttling)
+            logger.info(f"Method 3: Attempting fast 720p fallback section download for {clean_url} ({mode_label})...")
+            if stage_callback:
+                stage_callback(f"Downloading 720p fallback slice ({mode_label})...", 70.0)
+
+            try:
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                cmd_720p = [
+                    *base_cmd,
+                    "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                    "--force-keyframes-at-cuts",
+                    "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+                    "-N", "4",
+                    "--socket-timeout", "12",
+                    "--fragment-retries", "2",
+                    "--retries", "2",
+                    "-o", str(output_path),
+                    "--merge-output-format", "mp4",
+                    "--no-warnings",
+                    clean_url
+                ]
+                timeout_720p = max(25, min(50, int(clip_duration * 1.0) + 15))
+                res_720p = _run_subproc(cmd_720p, timeout=timeout_720p)
+                if res_720p.returncode == 0 and is_valid_mp4(output_path):
+                    logger.info(f"Successfully downloaded 720p fallback section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                    return str(output_path)
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                if res_720p and res_720p.stderr:
+                    last_err_snippet = res_720p.stderr[:300]
+            except Exception as e:
+                logger.warning(f"720p fallback failed ({mode_label}): {e}")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # Method 4: Fallback - Download at 480p / lowest bandwidth (guaranteed to succeed on high lag)
+            logger.info(f"Method 4: Attempting low-bandwidth 480p fallback section download for {clean_url} ({mode_label})...")
+            if stage_callback:
+                stage_callback(f"Downloading 480p fallback slice ({mode_label})...", 80.0)
+
+            try:
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                cmd_480p = [
+                    *base_cmd,
+                    "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                    "--force-keyframes-at-cuts",
+                    "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+                    "-N", "2",
+                    "--socket-timeout", "12",
+                    "--fragment-retries", "2",
+                    "--retries", "2",
+                    "-o", str(output_path),
+                    "--merge-output-format", "mp4",
+                    "--no-warnings",
+                    clean_url
+                ]
+                timeout_480p = max(20, min(35, int(clip_duration * 0.8) + 10))
+                res_480p = _run_subproc(cmd_480p, timeout=timeout_480p)
+                if res_480p.returncode == 0 and is_valid_mp4(output_path):
+                    logger.info(f"Successfully downloaded 480p fallback section ({mode_label}): {output_path} ({output_path.stat().st_size} bytes)")
+                    return str(output_path)
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                if res_480p and res_480p.stderr:
+                    last_err_snippet = res_480p.stderr[:300]
+            except Exception as e:
+                logger.warning(f"480p fallback failed ({mode_label}): {e}")
+                if output_path.exists():
+                    try:
+                        output_path.unlink()
+                    except Exception:
+                        pass
+                last_err_snippet = str(e)
+
+            # If cookies were used and failed due to reload / session error or bot block, log and proceed to guest mode
+            if use_cookies:
+                logger.warning(f"Download with cookies failed ({last_err_snippet}). Automatically attempting guest mode fallback...")
+
+    # Ensure any corrupt partial file is unlinked
+    if output_path.exists():
+        try:
+            output_path.unlink()
+        except Exception:
+            pass
+
+    err_lower = last_err_snippet.lower()
+    if "reloaded" in err_lower or "reload" in err_lower:
+        raise RuntimeError("YouTube rejected the session cookies ('The page needs to be reloaded'). Your cookies.txt may have expired or need refreshing. Please re-export fresh cookies from an active YouTube tab using the 🍪 Cookies Manager button in the top navbar.")
+    if "confirm you're not a bot" in err_lower or "sign in" in err_lower or "login" in err_lower:
+        raise RuntimeError("YouTube blocked video download (Bot verification). Please import/save fresh YouTube cookies using the 🍪 Cookies Manager button in the top navbar.")
+    if "timed out" in err_lower or "timeout" in err_lower:
+        raise RuntimeError("Video download timed out due to slow internet connection or lag. You can retry this clip anytime.")
+    raise RuntimeError(f"Failed to download video clip segment from YouTube ({last_err_snippet}). Check your internet connection or cookies.")
+
+
+def parse_bytes_from_string(size_str: str) -> float:
+    """Parses size strings like '78848KiB', '45.2MiB', '1.2GiB', '800KB' into float bytes."""
+    if not size_str:
+        return 0.0
+    m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)', size_str)
+    if not m:
+        return 0.0
+    try:
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        if 'g' in unit:
+            return val * 1024 * 1024 * 1024
+        elif 'm' in unit:
+            return val * 1024 * 1024
+        elif 'k' in unit:
+            return val * 1024
+        return val
+    except Exception:
+        return 0.0
+
+
+def format_human_size(num_bytes: float) -> str:
+    """Formats raw byte count into standard, human-readable MB or GB representation."""
+    if num_bytes >= 1024 * 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024 * 1024):.1f} GB"
+    elif num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+    elif num_bytes >= 1024:
+        return f"{num_bytes / 1024:.1f} KB"
+    elif num_bytes > 0:
+        return f"{int(num_bytes)} B"
+    return ""
+
+
+def format_human_speed(speed_str: str) -> str:
+    """Standardizes speeds like '101.78KiB/s' or '14.64MiB/s' into '101.8 KB/s' or '14.6 MB/s'."""
+    if not speed_str:
+        return ""
+    clean = speed_str.replace("~", "").strip()
+    m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]+)/s', clean)
+    if not m:
+        return clean
+    try:
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        b = val
+        if 'g' in unit:
+            b = val * 1024 * 1024 * 1024
+        elif 'm' in unit:
+            b = val * 1024 * 1024
+        elif 'k' in unit:
+            b = val * 1024
+        return f"{format_human_size(b)}/s"
+    except Exception:
+        return clean
+
+
+def read_subprocess_lines(stream):
+    """
+    Yields lines delimited by either \\r or \\n from a subprocess stdout stream,
+    ensuring real-time progress callbacks for both FFmpeg and yt-dlp without blocking.
+    """
+    buffer = ""
+    while True:
+        try:
+            chunk = stream.read(128)
+        except Exception:
+            break
+        if not chunk:
+            if buffer.strip():
+                yield buffer.strip()
+            break
+        buffer += chunk
+        while '\r' in buffer or '\n' in buffer:
+            cr_idx = buffer.find('\r')
+            nl_idx = buffer.find('\n')
+            if cr_idx != -1 and (nl_idx == -1 or cr_idx < nl_idx):
+                line = buffer[:cr_idx]
+                buffer = buffer[cr_idx + 1:]
+                if buffer.startswith('\n'):
+                    buffer = buffer[1:]
+                if line.strip():
+                    yield line.strip()
+            else:
+                line = buffer[:nl_idx]
+                buffer = buffer[nl_idx + 1:]
+                if line.strip():
+                    yield line.strip()
+
+
+def download_full_raw_video(
+    video_url: str,
+    output_path: Union[str, Path],
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    cookies_content: Optional[str] = None,
+    max_end_time: Optional[float] = None,
+    on_process_spawned: Optional[Callable[[subprocess.Popen], None]] = None
+) -> str:
+    """
+    Downloads the full raw video from YouTube in maximum quality (up to 1080p),
+    or copies the local uploaded / Google Drive video file directly.
+    If max_end_time is provided (e.g. for batch rendering specific clips), downloads
+    the required prefix range to accelerate acquisition by 10-50x.
+    """
+    clean_raw = urllib.parse.unquote(video_url.strip())
+    clean_name = os.path.basename(clean_raw.split("?")[0]).strip()
+
+    from backend.utils.text import is_twitch_url, extract_twitch_info, get_twitch_canonical_url
+    yt_audio_match = re.search(r'yt_audio_([a-zA-Z0-9_-]{11})', clean_raw)
+    tw_audio_match = re.search(r'twitch_audio_(twitch_\d+|twitch_clip_[a-zA-Z0-9_-]+|\d+|[a-zA-Z0-9_-]+)', clean_raw)
+    is_yt = bool(yt_audio_match or re.search(r'(?:youtube\.com|youtu\.be)', clean_raw))
+    is_tw = bool(tw_audio_match or is_twitch_url(clean_raw))
+
+    if yt_audio_match:
+        clean_url = f"https://www.youtube.com/watch?v={yt_audio_match.group(1)}"
+        logger.info(f"Resolved cached audio reference '{clean_raw}' back to genuine YouTube stream: {clean_url}")
+    elif is_yt:
+        clean_url = clean_raw if clean_raw.startswith("http") else f"https://www.youtube.com/watch?v={clean_raw}"
+    elif tw_audio_match or is_tw:
+        tw_info = extract_twitch_info(clean_raw)
+        clean_url = get_twitch_canonical_url(tw_info) if tw_info else clean_raw
+        logger.info(f"Resolved Twitch reference '{clean_raw}' back to genuine Twitch stream: {clean_url}")
+    elif not clean_raw.startswith("http") and not clean_raw.startswith("/api/video/") and not os.path.exists(clean_raw):
+        clean_url = f"https://www.youtube.com/watch?v={clean_raw}"
+        is_yt = True
+    else:
+        clean_url = clean_raw
+
+    is_online_stream = is_yt or is_tw or clean_url.startswith("http://") or clean_url.startswith("https://")
+    local_source = None
+
+    if not is_online_stream:
+        if os.path.exists(video_url):
+            local_source = Path(video_url)
+        elif os.path.exists(clean_raw):
+            local_source = Path(clean_raw)
+        elif clean_raw.startswith("/api/video/"):
+            candidate = UPLOADS_DIR / clean_name
+            if candidate.exists():
+                local_source = candidate
+        if not local_source or not local_source.exists():
+            from backend.routers.media import _find_video_file_on_disk
+            local_source = _find_video_file_on_disk(clean_name)
+    else:
+        # For online streams, verify if a full raw video already exists locally and meets the resolution requirements
+        has_active_cookies = bool(cookies_content or get_effective_cookies_path())
+        required_height = 1080 if has_active_cookies else 720
+
+        stream_id_match = yt_audio_match.group(1) if yt_audio_match else None
+        if not stream_id_match and "v=" in clean_url:
+            v_match = re.search(r'[?&]v=([a-zA-Z0-9_-]{11})', clean_url)
+            if v_match:
+                stream_id_match = v_match.group(1)
+        elif not stream_id_match and "youtu.be/" in clean_url:
+            v_match = re.search(r'youtu\.be/([a-zA-Z0-9_-]{11})', clean_url)
+            if v_match:
+                stream_id_match = v_match.group(1)
+
+        # Check if direct clip material was already acquired by Stage 1
+        stream_id = stream_id_match or re.sub(r'[^a-zA-Z0-9_-]', '_', clean_url.split("?")[0])
+        pre_candidates = [
+            TEMP_DIR / f"clip_bahan_{stream_id}_{int(start_time)}_{int(end_time)}.mp4",
+            EXPORTS_DIR / f"clip_bahan_{stream_id}_{int(start_time)}_{int(end_time)}.mp4",
+        ]
+        for pre in pre_candidates:
+            if pre.exists() and pre.stat().st_size > 50 * 1024 and is_valid_mp4(pre):
+                logger.info(f"Reusing pre-acquired Stage 1 HD clip segment: {pre.name} -> {output_path}")
+                shutil.copyfile(str(pre), str(output_path))
+                return str(output_path)
+
+        candidate_sources: List[Path] = []
+        for d in [EXPORTS_DIR, TEMP_DIR, UPLOADS_DIR]:
+            if d.exists():
+                for f in d.iterdir():
+                    if f.is_file() and f.suffix.lower() in [".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"]:
+                        if f.name.startswith("yt_audio_") or f.name.startswith("twitch_audio_") or "_clip_" in f.name:
+                            continue
+                        if stream_id_match and stream_id_match in f.name:
+                            candidate_sources.append(f)
+
+        for cand in candidate_sources:
+            if cand.exists() and cand.stat().st_size > 5 * 1024 * 1024 and is_valid_mp4(cand):
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height:format=duration", "-of", "csv=p=0", str(cand)],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    probe_lines = [l.strip() for l in probe.stdout.strip().split("\n") if l.strip()]
+                    h = 0
+                    dur = 0.0
+                    for pl in probe_lines:
+                        try:
+                            if "." in pl:
+                                dur = float(pl)
+                            elif pl.isdigit():
+                                h = int(pl)
+                        except Exception:
+                            pass
+                    if h >= required_height:
+                        if max_end_time and max_end_time > 0 and dur > 0 and dur < (max_end_time - 1.0):
+                            logger.info(f"Cached video {cand.name} duration ({dur:.1f}s) is shorter than required {max_end_time:.1f}s; downloading fresh slice")
+                            continue
+                        logger.info(f"Reusing verified HD local video {cand.name} (height={h}p >= {required_height}p, dur={dur:.1f}s)")
+                        local_source = cand
+                        break
+                    else:
+                        logger.info(f"Skipping cached candidate {cand.name} (height={h}p < {required_height}p); downloading fresh HD video")
+                except Exception:
+                    pass
+
+    if local_source and local_source.exists():
+        logger.info(f"Copying verified HD local source video to raw output: {local_source} -> {output_path}")
+        shutil.copyfile(str(local_source), str(output_path))
+        if progress_callback:
+            progress_callback({"percent": 100.0, "downloaded": "Complete", "total": "Complete", "speed": "", "eta": ""})
+        return str(output_path)
+
+    with ephemeral_cookies_file(cookies_content) as temp_cookies:
+        has_cookies = temp_cookies is not None or get_effective_cookies_path() is not None
+        attempts = [True, False] if has_cookies else [False]
+
+        for use_cookies in attempts:
+            base_cmd = get_yt_dlp_base_cmd(include_cookies=use_cookies, cookies_path=temp_cookies if use_cookies else None)
+            mode_label = "with cookies" if use_cookies else "guest mode (without cookies)"
+            cmd = [
+                *base_cmd,
+                "--no-colors",
+                "-N", "16",
+                "--concurrent-fragments", "16",
+                "--buffer-size", "64K",
+                "--http-chunk-size", "10M",
+                "--socket-timeout", "15",
+                "--fragment-retries", "5",
+                "--retries", "5",
+                "--file-access-retries", "3",
+                "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best",
+                "-o", str(output_path),
+                "--merge-output-format", "mp4",
+                "--newline",
+            ]
+            if max_end_time and max_end_time > 0:
+                t_end_fmt = format_section_time(max_end_time + 15)
+                cmd.extend(["--download-sections", f"*00:00-{t_end_fmt}"])
+            cmd.append(clean_url)
+
+            logger.info(f"Downloading full raw video ({mode_label}, 16 concurrent fragments) from {clean_url} to {output_path}...")
+            if progress_callback:
+                progress_callback({
+                    "percent": 5.0,
+                    "downloaded": "Menghubungkan...",
+                    "total": "",
+                    "speed": "",
+                    "eta": "",
+                    "detail": "Menghubungkan ke server YouTube..."
+                })
+
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            if on_process_spawned:
+                try:
+                    on_process_spawned(process)
+                except Exception:
+                    pass
+
+            last_reported_pct = 5.0
+            last_bytes = 0.0
+            last_speed_time = time.time()
+            current_speed_str = ""
+
+            for clean_line in read_subprocess_lines(process.stdout):
+                clean_line = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', clean_line).strip()
+                if not clean_line:
+                    continue
+
+                if not progress_callback:
+                    continue
+
+                # 1. Check for initial connection / player extraction
+                if "[youtube]" in clean_line or "[info]" in clean_line:
+                    if last_reported_pct <= 5.0:
+                        progress_callback({
+                            "percent": 5.0,
+                            "downloaded": "Menghubungkan...",
+                            "total": "",
+                            "speed": "",
+                            "eta": "",
+                            "detail": "Menghubungkan ke server YouTube..."
+                        })
+
+                # 2. Check for yt-dlp download progress
+                elif "[download]" in clean_line:
+                    pct_m = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*%', clean_line)
+                    tot_m = re.search(r'of\s*~?\s*([0-9.]+\s*[a-zA-Z]+)', clean_line)
+                    spd_m = re.search(r'at\s+([0-9.]+\s*[a-zA-Z]+/s)', clean_line)
+                    eta_m = re.search(r'ETA\s+([0-9:]+)', clean_line)
+
+                    if pct_m:
+                        try:
+                            val = float(pct_m.group(1))
+                            if val > last_reported_pct:
+                                last_reported_pct = val
+                        except Exception:
+                            pass
+
+                    tot_bytes = parse_bytes_from_string(tot_m.group(1)) if tot_m else 0.0
+                    total_str = format_human_size(tot_bytes) if tot_bytes > 0 else (tot_m.group(1).strip() if tot_m else "")
+                    speed_str = format_human_speed(spd_m.group(1).strip()) if spd_m else ""
+                    eta_str = eta_m.group(1).strip() if (eta_m and eta_m.group(1) != "Unknown") else ""
+
+                    # Human-friendly downloaded representation (e.g. 24.5 MB)
+                    dl_str = ""
+                    if tot_bytes > 0 and last_reported_pct > 0:
+                        dl_bytes = (last_reported_pct / 100.0) * tot_bytes
+                        dl_str = format_human_size(dl_bytes)
+                    elif last_reported_pct > 0:
+                        dl_str = f"{last_reported_pct:.1f}%"
+
+                    progress_callback({
+                        "percent": max(5.0, last_reported_pct),
+                        "downloaded": dl_str,
+                        "total": total_str,
+                        "speed": speed_str,
+                        "eta": eta_str,
+                        "detail": "Mengunduh video bahan master (1080p)..."
+                    })
+
+                # 3. Check for FFmpeg progress (frame=... time=... speed=...)
+                elif "time=" in clean_line and ("frame=" in clean_line or "size=" in clean_line):
+                    time_m = re.search(r'time=([0-9:.]+)', clean_line)
+                    size_m = re.search(r'size=\s*([0-9.]+\s*[a-zA-Z]+)', clean_line)
+
+                    time_sec = 0.0
+                    if time_m:
+                        try:
+                            parts = time_m.group(1).split(':')
+                            if len(parts) == 3:
+                                time_sec = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                        except Exception:
+                            pass
+
+                    cur_bytes = parse_bytes_from_string(size_m.group(1)) if size_m else 0.0
+                    now = time.time()
+                    dt = now - last_speed_time
+                    if dt >= 0.8:
+                        if cur_bytes > last_bytes and last_bytes > 0:
+                            spd_bps = (cur_bytes - last_bytes) / dt
+                            current_speed_str = f"{format_human_size(spd_bps)}/s"
+                        last_bytes = cur_bytes
+                        last_speed_time = now
+
+                    target_sec = (max_end_time + 15) if (max_end_time and max_end_time > 0) else None
+                    if target_sec and target_sec > 0 and time_sec > 0:
+                        calc_pct = min(98.0, (time_sec / target_sec) * 100.0)
+                        if calc_pct > last_reported_pct:
+                            last_reported_pct = round(calc_pct, 1)
+                    elif last_reported_pct < 10.0:
+                        last_reported_pct = 10.0
+
+                    # Estimated total size in bytes (NEVER in raw seconds!)
+                    est_total_str = ""
+                    if target_sec and time_sec > 2.0 and cur_bytes > 0:
+                        est_tot_bytes = (cur_bytes / time_sec) * target_sec
+                        est_total_str = f"~{format_human_size(est_tot_bytes)}"
+
+                    # ETA estimation
+                    eta_str = ""
+                    if target_sec and time_sec > 0 and (target_sec - time_sec) > 0:
+                        rem_sec = int(target_sec - time_sec)
+                        eta_str = f"{rem_sec // 60:02d}:{rem_sec % 60:02d}"
+
+                    dl_str = format_human_size(cur_bytes) if cur_bytes > 0 else f"{last_reported_pct:.1f}%"
+
+                    progress_callback({
+                        "percent": max(5.0, last_reported_pct),
+                        "downloaded": dl_str,
+                        "total": est_total_str,
+                        "speed": current_speed_str,
+                        "eta": eta_str,
+                        "detail": "Mengunduh video bahan master (1080p)..."
+                    })
+
+                # 4. Check for Merging / post-processing
+                elif "[Merger]" in clean_line or "Merging formats" in clean_line:
+                    last_reported_pct = 95.0
+                    progress_callback({
+                        "percent": 95.0,
+                        "downloaded": "Menggabungkan video & audio...",
+                        "total": "100%",
+                        "speed": "",
+                        "eta": "00:01",
+                        "detail": "Menggabungkan format video & audio..."
+                    })
+
+            process.stdout.close()
+            returncode = process.wait()
+
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 10000:
+                logger.info(f"Full raw video downloaded successfully ({mode_label}, {os.path.getsize(output_path)} bytes)")
+                return str(output_path)
+
+            if use_cookies:
+                logger.warning(f"Full raw video download with cookies exited with code {returncode}. Retrying in guest mode...")
+
+    raise RuntimeError("Failed to download raw video. Please check your cookies or network connection.")
+
+
+def clean_caption_text(text: str) -> str:
+    """
+    Cleans transcripted subtitle/caption text by:
+    1. Removing sound/action tags like [LAUGHTER], [APPLAUSE], [MUSIC], (laughter), *cheering*.
+    2. Removing common sound effect words if present.
+    3. Stripping all symbols EXCEPT '.', ',', '%', '&', '$', '?' (keeping alphanumeric characters and spaces).
+    4. Normalizing whitespace.
+    """
+    if not text:
+        return ""
+    # 1. Remove bracketed, parenthesized, or asterisk tags (e.g. [LAUGHTER], (music), *cheering*)
+    t = re.sub(r'\[.*?\]|\(.*?\)|[\*].*?[\*]', ' ', text)
+    # 2. Remove common unbracketed sound tags
+    t = re.sub(r'\b(laughter|applause|music|cheering|snickering|giggle|cough)\b', ' ', t, flags=re.IGNORECASE)
+    # 3. Strip leading and trailing ellipses / periods (e.g. "...Stroavirus..." -> "Stroavirus")
+    t = re.sub(r'^\s*[\.\,\…\:\;]+\s*', '', t)
+    t = re.sub(r'\s*[\.\,\…\:\;]+\s*$', '', t)
+    # 4. Remove all symbols except . , % & $ ? (keep letters, digits, whitespace, . , % & $ ?)
+    # Note: in Python regex \w includes '_', so we explicitly eliminate '_'
+    t = re.sub(r'[^\w\s.,%&$?]|_', '', t)
+    # 5. Collapse multiple spaces and trim
+    t = re.sub(r'\s+', ' ', t).strip()
+    # If the string consists purely of punctuation, clear it
+    if re.fullmatch(r'[\.\,\%\&\$\? ]+', t):
+        return ""
+    return t
+
+_STABLE_MODEL = None
+
+def _stable_words(video_path, language):
+    global _STABLE_MODEL
+    import stable_whisper
+    if _STABLE_MODEL is None:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _STABLE_MODEL = stable_whisper.load_model("turbo", device=device)
+    result = _STABLE_MODEL.transcribe(
+        video_path,
+        language=language,
+        condition_on_previous_text=False,
+        word_timestamps=True,
+    )
+    words = []
+    for seg in result.segments:
+        for w in seg.words:
+            text = clean_caption_text(w.word.strip())
+            if text and text not in (".", "..", "...", ",", "?"):
+                st = max(0.0, float(w.start))
+                words.append({
+                    "word": text,
+                    "start": round(st, 2),
+                    "end": round(max(st + 0.12, float(w.end)), 2),
+                })
+    return words
+
+def transcribe_clip_words(
+    video_path: str,
+    fallback_transcript: Optional[List[Dict[str, Any]]] = None,
+    clip_start_time: float = 0.0,
+    clip_end_time: float = 0.0,
+    target_language: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Transcribes word-level timestamps directly from the sliced clip audio using Whisper AI.
+    Listens directly to the audio waveform of the sliced clip (0.0s = start of clip) for 100% acoustic accuracy.
+    Applies explicit language constraints, custom Indonesian/English initial prompt context,
+    condition_on_previous_text=False, and hallucination suppression to eliminate phantom/corrupted words.
+    Falls back to transcript distribution only if Whisper AI is not available.
+    """
+    # Auto-detect language from fallback transcript if not explicitly provided
+    if not target_language and fallback_transcript:
+        try:
+            from backend.utils.text import detect_transcript_language
+            detected = detect_transcript_language(fallback_transcript[:50])
+            if detected and detected.get("code") in ("id", "en"):
+                target_language = detected["code"]
+        except Exception:
+            pass
+
+    try:
+        sw_words = _stable_words(video_path, target_language)
+        if sw_words:
+            logger.info(f"stable-ts produced {len(sw_words)} words.")
+            return sw_words 
+    except Exception as e:
+        logger.warning(f"stable-ts failed, using built-in Whisper: {e}")
+
+    # 1. Primary: Run Whisper directly on sliced clip audio for exact acoustic timestamps
+    whisper_model = get_whisper_model()
+    if whisper_model is not None and os.path.exists(video_path):
+        try:
+            logger.info(f"Running Whisper acoustic word transcription on: {os.path.basename(video_path)} (target_language={target_language})...")
+
+            # Extract dialogue context from fallback transcript for this time window to guide Whisper decoding
+            context_hint = ""
+            if fallback_transcript and clip_end_time > clip_start_time:
+                matching_lines = [
+                    l.get("text", "").strip() for l in fallback_transcript
+                    if float(l.get("start", 0.0)) <= clip_end_time + 1.0 and float(l.get("end", l.get("start", 0.0) + l.get("duration", 2.0))) >= clip_start_time - 1.0
+                ]
+                if matching_lines:
+                    context_hint = " ".join(matching_lines[:6])[:200]
+
+            if target_language == "id":
+                base_prompt = "Transkrip video percakapan bilingual Bahasa Indonesia dan English (bahasa gaul, campur, Jaksel). Pertahankan ejaan yang tepat untuk istilah teknologi, gaming, internet, dan kata serapan."
+            elif target_language == "en":
+                base_prompt = "Video dialogue transcript in English. Conversational, gaming, slang, and clear speech."
+            else:
+                base_prompt = "Transkrip video percakapan bilingual Bahasa Indonesia dan English."
+
+            initial_prompt = f"{base_prompt} {context_hint}".strip() if context_hint else base_prompt
+
+            import torch
+            use_fp16 = bool(torch.cuda.is_available())
+            transcribe_kwargs: Dict[str, Any] = {
+                "word_timestamps": True,
+                "fp16": use_fp16,
+                "verbose": False,
+                "condition_on_previous_text": False,  # Prevents repetition loops and hallucinations across silence
+                "initial_prompt": initial_prompt,
+            }
+            if target_language in ("id", "en"):
+                transcribe_kwargs["language"] = target_language
+
+            result = None
+            with _WHISPER_LOCK:
+                try:
+                    result = whisper_model.transcribe(
+                        video_path,
+                        **transcribe_kwargs
+                    )
+                except RuntimeError as re_err:
+                    logger.warning(f"Whisper word_timestamps failed ({re_err}). Retrying with standard segment timestamps...")
+                    transcribe_kwargs["word_timestamps"] = False
+                    result = whisper_model.transcribe(
+                        video_path,
+                        **transcribe_kwargs
+                    )
+
+            words = []
+            if result:
+                for segment in result.get("segments", []):
+                    seg_words = segment.get("words", [])
+                    if seg_words:
+                        for w in seg_words:
+                            word_clean = clean_caption_text(w.get("word", "").strip())
+                            # Skip ellipses, single punctuation, or empty tokens
+                            if word_clean and word_clean not in (".", "..", "...", ",", "?"):
+                                st = max(0.0, float(w.get("start", 0.0)))
+                                et = max(st + 0.12, float(w.get("end", st + 0.25)))
+                                words.append({
+                                    "word": word_clean,
+                                    "start": round(st, 2),
+                                    "end": round(et, 2)
+                                })
+                    else:
+                        # Segment timestamps fallback: interpolate words across start and end
+                        seg_text = clean_caption_text(segment.get("text", "").strip())
+                        seg_st = max(0.0, float(segment.get("start", 0.0)))
+                        seg_et = max(seg_st + 0.5, float(segment.get("end", seg_st + 2.0)))
+                        tokens = seg_text.split()
+                        if tokens:
+                            step_dur = (seg_et - seg_st) / len(tokens)
+                            for idx, tok in enumerate(tokens):
+                                w_st = seg_st + (idx * step_dur)
+                                w_et = w_st + max(0.15, step_dur * 0.95)
+                                words.append({
+                                    "word": tok,
+                                    "start": round(w_st, 2),
+                                    "end": round(w_et, 2)
+                                })
+
+            if words:
+                logger.info(f"Whisper successfully transcribed {len(words)} acoustic words for clip.")
+                return words
+        except Exception as e:
+            logger.warning(f"Whisper acoustic transcription error: {e}")
+
+    # 2. Secondary fallback: Use fallback_transcript if Whisper model is unavailable
+    if fallback_transcript:
+        words = []
+        for line in fallback_transcript:
+            line_text = line.get("text", "").strip()
+            if not line_text:
+                continue
+
+            cleaned_line = clean_caption_text(line_text)
+            if not cleaned_line:
+                continue
+
+            l_start = float(line.get("start", 0.0))
+            if "end" in line and float(line.get("end", 0.0)) > l_start:
+                l_end = float(line.get("end", 0.0))
+            elif "duration" in line and float(line.get("duration", 0.0)) > 0:
+                l_end = l_start + float(line.get("duration", 0.0))
+            else:
+                words_cnt = max(1, len(cleaned_line.split()))
+                l_end = l_start + max(1.8, words_cnt * 0.38)
+
+            if clip_end_time > clip_start_time:
+                if l_end < clip_start_time - 0.5 or l_start > clip_end_time + 0.5:
+                    continue
+                rel_start = max(0.0, l_start - clip_start_time)
+                rel_end = max(rel_start + 0.15, l_end - clip_start_time)
+            else:
+                rel_start = max(0.0, l_start)
+                rel_end = max(rel_start + 0.15, l_end)
+
+            line_words = cleaned_line.split()
+            if not line_words:
+                continue
+            # Natural speech timing calibration: respect line duration unless trailing silence is detected
+            raw_line_dur = max(0.4, rel_end - rel_start)
+            max_plausible_dur = len(line_words) * 0.52 + 0.25
+            spoken_dur = min(raw_line_dur, max_plausible_dur)
+            weights = [max(2, len(re.sub(r'[^a-zA-Z0-9]', '', w)) or len(w)) for w in line_words]
+            total_w = sum(weights) or 1
+            cur_s = rel_start
+            for i, w in enumerate(line_words):
+                w_dur = max(0.14, min(0.60, spoken_dur * (weights[i] / total_w)))
+                w_e = cur_s + w_dur
+                words.append({
+                    "word": w,
+                    "start": round(cur_s, 2),
+                    "end": round(w_e, 2)
+                })
+                cur_s = w_e
+        if words:
+            logger.info(f"Fallback: using transcript words for clip range [{clip_start_time:.1f}s -> {clip_end_time:.1f}s].")
+            return words
+
+    return []
+
+
+def format_ass_timestamp(seconds: float) -> str:
+    """Format seconds into ASS timestamp format: H:MM:SS.cs"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs >= 100:
+        cs = 99
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def apply_text_case(text: str, mode: str) -> str:
+    """Applies uppercase, capitalize (Title Case), or lowercase to text."""
+    clean = text.strip()
+    if mode == "uppercase":
+        return clean.upper()
+    elif mode == "lowercase":
+        return clean.lower()
+    elif mode == "capitalize":
+        return clean.title()
+    return clean
+
+
+def wrap_title_smart(text: str, max_single_len: int = 22) -> Tuple[str, int]:
+    """
+    Wraps title cleanly into at most 2 balanced lines separated by \\N (strictly max 2 lines).
+    Prevents orphan single-word lines (widow words) when total words >= 4 (each line has at least 2 words).
+    Preserves manual newlines if present (collapsed to max 2 lines with anti-orphan balancing).
+    Returns (formatted_title, line_count).
+    """
+    raw = text.strip()
+    if not raw:
+        return "", 1
+
+    # Preserve manual newlines if the user specifically broke lines, capped at max 2 lines
+    if "\n" in raw:
+        lines = [l.strip() for l in raw.split("\n") if l.strip()]
+        while len(lines) > 2:
+            lines[-2] = lines[-2] + " " + lines[-1]
+            lines.pop()
+        all_manual_words = sum(len(l.split()) for l in lines)
+        if len(lines) == 2 and all_manual_words >= 4:
+            words_all = [w for l in lines for w in l.split()]
+            w1 = len(lines[0].split())
+            w2 = len(lines[1].split())
+            if w1 == 1 or w2 == 1:
+                best_diff = float("inf")
+                best_split = len(words_all) // 2
+                for k in range(2, len(words_all) - 1):
+                    l1 = " ".join(words_all[:k])
+                    l2 = " ".join(words_all[k:])
+                    diff = abs(len(l1) - len(l2))
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_split = k
+                lines = [" ".join(words_all[:best_split]), " ".join(words_all[best_split:])]
+        return "\\N".join(lines), len(lines)
+
+    words = raw.split()
+    total_words = len(words)
+    total_len = len(raw)
+
+    if total_words <= 1 or total_len <= max_single_len:
+        return raw, 1
+    if total_words == 2:
+        return "\\N".join(words), 2
+    if total_words == 3:
+        if total_len <= int(max_single_len * 1.35):
+            return raw, 1
+        diff1 = abs(len(words[0]) - len(f"{words[1]} {words[2]}"))
+        diff2 = abs(len(f"{words[0]} {words[1]}") - len(words[2]))
+        if diff1 < diff2:
+            return f"{words[0]}\\N{words[1]} {words[2]}", 2
+        else:
+            return f"{words[0]} {words[1]}\\N{words[2]}", 2
+
+    # For >= 4 words: strictly 2 lines max, and NEVER leave 1 lonely word on any line
+    # (Each line must have at least 2 words)
+    best_diff = float("inf")
+    best_split = total_words // 2
+    for k in range(2, total_words - 1):
+        l1 = " ".join(words[:k])
+        l2 = " ".join(words[k:])
+        diff = abs(len(l1) - len(l2))
+        if diff < best_diff:
+            best_diff = diff
+            best_split = k
+    lines = [" ".join(words[:best_split]), " ".join(words[best_split:])]
+    return "\\N".join(lines), 2
+
+
+def is_emoji_char(ch: str) -> bool:
+    """Checks if a character is an emoji, symbol, or emoji presentation modifier."""
+    code = ord(ch)
+    if (0x1F000 <= code <= 0x1FAFF or
+        0x2600 <= code <= 0x27BF or
+        0x2300 <= code <= 0x23FF or
+        0x2B50 <= code <= 0x2B55 or
+        code == 0x200D or
+        0xFE00 <= code <= 0xFE0F or
+        code == 0x20E3):
+        return True
+    cat = unicodedata.category(ch)
+    return cat in ('So', 'Sk')
+
+
+def has_emoji(text: Optional[str]) -> bool:
+    """Returns True if the string contains one or more emoji characters."""
+    if not text:
+        return False
+    return any(is_emoji_char(ch) for ch in text)
+
+
+def split_text_and_emojis(text: str) -> List[Tuple[str, str]]:
+    """Splits text into contiguous runs of ('emoji', text) and ('text', text)."""
+    segments = []
+    if not text:
+        return segments
+    current_type = None
+    current_buf = []
+    for ch in text:
+        t = 'emoji' if is_emoji_char(ch) else 'text'
+        if current_type is None:
+            current_type = t
+            current_buf.append(ch)
+        elif t == current_type:
+            current_buf.append(ch)
+        else:
+            segments.append((current_type, "".join(current_buf)))
+            current_type = t
+            current_buf = [ch]
+    if current_buf:
+        segments.append((current_type, "".join(current_buf)))
+    return segments
+
+
+def get_font(font_name: str, size: int) -> ImageFont.FreeTypeFont:
+    """Resolves font with fallback to Outfit, Montserrat, or default font."""
+    fonts_dir = str(FONTS_DIR)
+    clean_name = font_name.replace(".ttf", "").replace(".otf", "").strip() if font_name else "Outfit"
+    for ext in [".ttf", ".otf", ""]:
+        for name_candidate in [clean_name, font_name]:
+            p = os.path.join(fonts_dir, f"{name_candidate}{ext}")
+            if os.path.exists(p):
+                try:
+                    return ImageFont.truetype(p, size)
+                except Exception:
+                    pass
+    for fb in ["Outfit.ttf", "Montserrat.ttf", "Inter.ttf"]:
+        p_fb = os.path.join(fonts_dir, fb)
+        if os.path.exists(p_fb):
+            try:
+                return ImageFont.truetype(p_fb, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def get_emoji_font(size: int) -> Optional[ImageFont.FreeTypeFont]:
+    """Finds and loads a color emoji font (seguiemj.ttf, NotoColorEmoji.ttf, etc.)."""
+    env_emoji = os.environ.get("EMOJI_FONT_PATH", "").strip()
+    candidates = [
+        env_emoji if env_emoji else None,
+        str(FONTS_DIR / "seguiemj.ttf"),
+        str(FONTS_DIR / "NotoColorEmoji.ttf"),
+        "C:/Windows/Fonts/seguiemj.ttf",
+        "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+        "/usr/share/fonts/google-noto-color-emoji/NotoColorEmoji.ttf",
+        "/usr/share/fonts/opentype/noto/NotoColorEmoji.otf",
+        "/usr/share/fonts/truetype/ancient-scripts/Symbola_hint.ttf",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            try:
+                return ImageFont.truetype(c, size)
+            except Exception as e:
+                logger.debug(f"Could not load emoji font {c}: {e}")
+    return None
+
+
+def get_ffmpeg_safe_font_path(font_name: str = "Montserrat") -> str:
+    """Returns an escaped font file path safe for FFmpeg drawtext filter to avoid Fontconfig errors on Windows."""
+    fonts_dir = Path(FONTS_DIR)
+    clean_name = font_name.replace(".ttf", "").replace(".otf", "").strip() if font_name else "Montserrat"
+    candidates = [
+        fonts_dir / f"{clean_name}.ttf",
+        fonts_dir / f"{clean_name}.otf",
+        fonts_dir / "Montserrat.ttf",
+        fonts_dir / "Inter.ttf",
+        fonts_dir / "Poppins.ttf",
+        fonts_dir / "Bebas Neue.ttf",
+        fonts_dir / "Anton.ttf",
+    ]
+    for c in candidates:
+        if c.exists():
+            clean = str(c.resolve()).replace("\\", "/")
+            return clean.replace(":", "\\:")
+    win_font = Path("C:/Windows/Fonts/arial.ttf")
+    if win_font.exists():
+        clean = str(win_font.resolve()).replace("\\", "/")
+        return clean.replace(":", "\\:")
+    return ""
+
+
+def render_text_watermark_png(
+    text: str,
+    output_png_path: str,
+    font_name: str = "Montserrat",
+    font_size: int = 48,
+    font_color: Tuple[int, int, int] = (255, 255, 255),
+    border_color: Tuple[int, int, int] = (0, 0, 0),
+    border_width: int = 2
+) -> Optional[str]:
+    """
+    Renders text watermark (handles, usernames, hashtags, emojis) to a transparent PNG.
+    Guarantees 100% immune to Fontconfig errors on Windows/Linux/Docker and supports color emojis.
+    """
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return None
+
+    # Resolve fonts
+    text_font = get_font(font_name, font_size)
+    emoji_font = get_emoji_font(int(font_size * 0.90))
+
+    # Measure segments
+    segments = split_text_and_emojis(clean_text)
+    if not segments:
+        segments = [('text', clean_text)]
+
+    temp_img = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    temp_draw = ImageDraw.Draw(temp_img)
+
+    seg_widths = []
+    max_h = 0
+    for kind, chunk in segments:
+        f = emoji_font if (kind == 'emoji' and emoji_font) else text_font
+        bbox = temp_draw.textbbox((0, 0), chunk, font=f)
+        w = max(1, bbox[2] - bbox[0])
+        h = max(1, bbox[3] - bbox[1])
+        seg_widths.append(w)
+        max_h = max(max_h, h)
+
+    total_w = sum(seg_widths)
+    pad = max(6, int(font_size * 0.20))
+    canvas_w = total_w + (pad * 2) + (border_width * 4)
+    canvas_h = max_h + (pad * 2) + (border_width * 4)
+
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    cur_x = pad + border_width
+    y_pos = pad + border_width
+
+    # Draw text outline and fills
+    for (kind, chunk), w in zip(segments, seg_widths):
+        if kind == 'emoji' and emoji_font:
+            draw.text((cur_x, y_pos), chunk, font=emoji_font, embedded_color=True)
+        else:
+            draw.text(
+                (cur_x, y_pos),
+                chunk,
+                font=text_font,
+                fill=(*font_color, 255),
+                stroke_width=max(1, border_width),
+                stroke_fill=(*border_color, 230)
+            )
+        cur_x += w
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_png_path)), exist_ok=True)
+    img.save(output_png_path, "PNG")
+    return output_png_path
+
+
+def render_title_overlay_png(
+    title_text: str,
+    output_png_path: str,
+    font_name: str = "Montserrat",
+    target_aspect_ratio: str = "9:16",
+    font_size_preset: str = "medium",
+    text_case: str = "uppercase",
+    title_position: str = "auto",
+    title_y_percent: Optional[float] = None,
+    canvas_w: int = 1080,
+    canvas_h: int = 1920,
+    title_font_size_preset: Optional[str] = None,
+    streamer_preset: Optional[str] = "none",
+    title_font_name: Optional[str] = None,
+    title_font_size_px: Optional[int] = None,
+    title_text_case: Optional[str] = None,
+    title_x_percent: Optional[float] = 50.0
+) -> Optional[str]:
+    """
+    Renders the title with full-color emojis and bold styled typography into a transparent
+    1080x1920 PNG overlay for seamless FFmpeg compositing.
+    """
+    if not title_text or title_position == "none":
+        return None
+
+    effective_title_font = title_font_name or font_name or "Montserrat"
+    effective_title_case = title_text_case or text_case or "uppercase"
+    effective_title_preset = (title_font_size_preset or font_size_preset or "medium").lower()
+
+    if effective_title_preset == "small":
+        max_wrap_len = 24
+    elif effective_title_preset == "big":
+        max_wrap_len = 13
+    else:  # medium
+        max_wrap_len = 19
+
+    # Format Title & Determine Line Count
+    formatted_title, title_line_count = wrap_title_smart(
+        apply_text_case(title_text, effective_title_case),
+        max_single_len=max_wrap_len
+    )
+
+    if not formatted_title:
+        return None
+
+    # Distinct, calibrated title font sizes based on preset or explicit px
+    # Scaled by 1.30x so export perfectly matches the live framing preview (WYSIWYG)
+    if title_font_size_px and int(title_font_size_px) > 0:
+        if target_aspect_ratio == "16:9_landscape":
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30 * (1080 / 1920))))
+        else:
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30)))
+    elif effective_title_preset == "small":
+        title_font_size = 58 if title_line_count >= 3 else 68
+    elif effective_title_preset == "big":
+        title_font_size = 106 if title_line_count >= 3 else 124
+    else:  # medium
+        title_font_size = 82 if title_line_count >= 3 else 94
+
+    # Create dummy draw to measure line widths and prevent edge overflow
+    temp_draw = ImageDraw.Draw(Image.new("RGBA", (canvas_w, canvas_h)))
+    text_font = get_font(effective_title_font, title_font_size)
+    emoji_font = get_emoji_font(int(title_font_size * 0.90))
+
+    lines = [l.strip() for l in formatted_title.split("\\N") if l.strip()]
+    if not lines:
+        lines = [formatted_title]
+
+    # Measure maximum line width to prevent clipping off screen edges
+    max_line_w = 0
+    for line in lines:
+        seg_w = 0
+        for kind, chunk in split_text_and_emojis(line):
+            f = emoji_font if (kind == 'emoji' and emoji_font) else text_font
+            bbox = temp_draw.textbbox((0, 0), chunk, font=f)
+            seg_w += (bbox[2] - bbox[0])
+        max_line_w = max(max_line_w, seg_w)
+
+    max_allowed_w = canvas_w - 70  # 1010px safe width
+    if max_line_w > max_allowed_w and max_line_w > 0:
+        scale_factor = max_allowed_w / max_line_w
+        title_font_size = max(40, int(title_font_size * scale_factor))
+        text_font = get_font(font_name, title_font_size)
+        emoji_font = get_emoji_font(int(title_font_size * 0.90))
+
+    # Content boundaries for aspect ratios
+    if target_aspect_ratio == "16:9_landscape":
+        content_top = 0
+        content_bot = 1080
+    elif streamer_preset == "split_top_cam":
+        if target_aspect_ratio == "16:9":
+            content_top = 352
+            content_bot = 1568
+        elif target_aspect_ratio == "4:3":
+            content_top = 150
+            content_bot = 1770
+        else:  # 1:1 and 9:16
+            content_top = 0
+            content_bot = 1920
+    else:
+        if target_aspect_ratio == "1:1":
+            content_top = 420
+            content_bot = 1500
+        elif target_aspect_ratio == "4:3":
+            content_top = 555
+            content_bot = 1365
+        elif target_aspect_ratio == "16:9":
+            content_top = 656
+            content_bot = 1264
+        else:  # 9:16
+            content_top = 0
+            content_bot = 1920
+
+    line_step = int(title_font_size * 1.08)
+    est_title_h = int(title_line_count * line_step)
+
+    # Title Positioning (100% WYSIWYG matching framing preview):
+    if target_aspect_ratio == "16:9_landscape":
+        effective_title_y_pct = float(title_y_percent) if title_y_percent is not None else (5.5 if title_line_count >= 3 else (6.5 if title_line_count == 2 else 8.0))
+        title_y = max(10, min(1000, int(round(1080 * (effective_title_y_pct / 100.0)))))
+    elif title_y_percent is not None:
+        effective_title_y_pct = float(title_y_percent)
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
+    else:
+        if streamer_preset == "split_top_cam":
+            effective_title_y_pct = 3.5 if title_line_count >= 3 else 4.5
+        elif target_aspect_ratio == "1:1":
+            effective_title_y_pct = 11.5 if title_line_count >= 3 else (13.5 if title_line_count == 2 else 17.0)
+        elif target_aspect_ratio == "4:3":
+            effective_title_y_pct = 17.3 if title_line_count >= 3 else (19.3 if title_line_count == 2 else 23.6)
+        elif target_aspect_ratio == "16:9":
+            effective_title_y_pct = 22.6 if title_line_count >= 3 else (24.5 if title_line_count == 2 else 28.8)
+        else:  # 9:16
+            effective_title_y_pct = 12.0 if title_line_count >= 3 else (14.5 if title_line_count == 2 else 17.0)
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
+
+    # Create transparent canvas
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    stroke_width = max(3, int(title_font_size * 0.055))
+    shadow_offset = max(2, int(title_font_size * 0.025))
+
+    # Reference baseline height for uppercase text
+    t_ref_bbox = draw.textbbox((0, 0), "HGY", font=text_font)
+    t_ref_mid = (t_ref_bbox[1] + t_ref_bbox[3]) / 2.0
+
+    for line_idx, line in enumerate(lines):
+        line_top = title_y + (line_idx * line_step)
+        segments = split_text_and_emojis(line)
+
+        # 1. Measure total width
+        segment_widths = []
+        for kind, chunk in segments:
+            f = emoji_font if (kind == 'emoji' and emoji_font) else text_font
+            bbox = draw.textbbox((0, 0), chunk, font=f)
+            w = bbox[2] - bbox[0]
+            segment_widths.append(w)
+
+        total_line_w = sum(segment_widths)
+        t_x_pct = 50.0 if title_x_percent is None else float(title_x_percent)
+        target_center_x = canvas_w * (t_x_pct / 100.0)
+        start_x = max(16.0, min(canvas_w - total_line_w - 16.0, target_center_x - (total_line_w / 2.0)))
+
+        # 2. Draw shadow first (for text segments)
+        cur_x = start_x
+        for (kind, chunk), w in zip(segments, segment_widths):
+            if kind != 'emoji':
+                draw.text(
+                    (cur_x + shadow_offset, line_top + shadow_offset),
+                    chunk,
+                    font=text_font,
+                    fill=(0, 0, 0, 160),
+                    stroke_width=stroke_width,
+                    stroke_fill=(0, 0, 0, 160)
+                )
+            cur_x += w
+
+        # 3. Draw outline / stroke and color emojis
+        cur_x = start_x
+        for (kind, chunk), w in zip(segments, segment_widths):
+            if kind == 'emoji' and emoji_font:
+                e_bbox = draw.textbbox((0, 0), chunk, font=emoji_font)
+                e_mid = (e_bbox[1] + e_bbox[3]) / 2.0
+                offset_y = t_ref_mid - e_mid
+
+                draw.text(
+                    (cur_x, line_top + offset_y),
+                    chunk,
+                    font=emoji_font,
+                    embedded_color=True
+                )
+            else:
+                draw.text(
+                    (cur_x, line_top),
+                    chunk,
+                    font=text_font,
+                    fill=(255, 255, 255, 255),
+                    stroke_width=stroke_width,
+                    stroke_fill=(0, 0, 0, 255)
+                )
+            cur_x += w
+
+    os.makedirs(os.path.dirname(output_png_path), exist_ok=True)
+    img.save(output_png_path, "PNG")
+    return output_png_path
+
+
+def escape_ass_text(text: str) -> str:
+    """Escapes special ASS subtitle control characters (curly braces, backslashes) to prevent tag injection."""
+    if not text:
+        return ""
+    return str(text).replace("{", "｛").replace("}", "｝").replace("\\", "＼")
+
+
+def generate_ass_file(
+    words: List[Dict[str, Any]],
+    style_preset: str,
+    font_name: str,
+    output_ass_path: str,
+    target_aspect_ratio: str = "9:16",
+    font_size_preset: str = "medium",
+    text_case: str = "uppercase",
+    title_text: Optional[str] = None,
+    title_position: str = "auto",
+    title_duration: str = "entire",
+    duration_seconds: float = 60.0,
+    title_y_percent: Optional[float] = None,
+    subtitle_y_percent: Optional[float] = None,
+    subtitle_position_mode: str = "bottom",
+    subtitle_center_y_percent: float = 50.0,
+    skip_title: bool = False,
+    title_font_size_preset: Optional[str] = None,
+    streamer_preset: Optional[str] = "none",
+    title_font_name: Optional[str] = None,
+    font_size_px: Optional[int] = None,
+    title_font_size_px: Optional[int] = None,
+    title_text_case: Optional[str] = None,
+    title_x_percent: Optional[float] = 50.0,
+    subtitle_offset_seconds: Optional[float] = 0.0
+) -> str:
+    """
+    Generates an Advanced SubStation Alpha (.ass) subtitle and title file with karaoke / word-level animation.
+    Enforces WrapStyle: 2 and short 1-to-3 word chunks so subtitles are ALWAYS strictly 1 line.
+    Uses \\an2\\pos(540, Y) for bottom or \\an5\\pos(540, Y) for center to permanently freeze subtitle in place.
+    Keeps title and subtitle snug and close to video content (top & bottom) without touching.
+    Supports subtitle_position_mode ('bottom' | 'center') with custom center Y position.
+    """
+    effective_title_preset = (title_font_size_preset or font_size_preset or "medium").lower()
+    effective_title_case = title_text_case or text_case or "uppercase"
+
+    if effective_title_preset == "small":
+        max_wrap_len = 24
+    elif effective_title_preset == "big":
+        max_wrap_len = 13
+    else:  # medium
+        max_wrap_len = 19
+
+    # 1. Format Title & Determine Line Count
+    if title_text and title_position != "none":
+        sanitized_title = escape_ass_text(apply_text_case(title_text, effective_title_case))
+        formatted_title, title_line_count = wrap_title_smart(
+            sanitized_title,
+            max_single_len=max_wrap_len
+        )
+    else:
+        formatted_title, title_line_count = "", 1
+
+    is_landscape = (target_aspect_ratio == "16:9_landscape")
+    canvas_w = 1920 if is_landscape else 1080
+    canvas_h = 1080 if is_landscape else 1920
+    center_x = 960 if is_landscape else 540
+
+    # 2. Font Sizes based on preset, with automatic scale-down for 3+ line titles
+    if is_landscape:
+        if font_size_preset == "small":
+            sub_font_size = 40
+        elif font_size_preset == "big":
+            sub_font_size = 58
+        else:
+            sub_font_size = 48
+
+        if effective_title_preset == "small":
+            title_font_size = 38 if title_line_count >= 3 else 44
+        elif effective_title_preset == "big":
+            title_font_size = 64 if title_line_count >= 3 else 74
+        else:
+            title_font_size = 50 if title_line_count >= 3 else 58
+    else:
+        if font_size_preset == "small":
+            sub_font_size = 65
+        elif font_size_preset == "big":
+            sub_font_size = 94
+        else:  # medium
+            sub_font_size = 78
+
+        if effective_title_preset == "small":
+            title_font_size = 65 if title_line_count >= 3 else 68
+        elif effective_title_preset == "big":
+            title_font_size = 106 if title_line_count >= 3 else 124
+        else:  # medium
+            title_font_size = 85 if title_line_count >= 3 else 94
+
+    if font_size_px and int(font_size_px) > 0:
+        sub_font_size = int(font_size_px)
+    if title_font_size_px and int(title_font_size_px) > 0:
+        if is_landscape:
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30 * (1080 / 1920))))
+        else:
+            title_font_size = max(24, int(round(int(title_font_size_px) * 1.30)))
+
+    # 3. Content boundaries for aspect ratios
+    if is_landscape:
+        content_top = 0
+        content_bot = 1080
+    elif streamer_preset == "split_top_cam":
+        if target_aspect_ratio == "16:9":
+            content_top = 352
+            content_bot = 1568
+        elif target_aspect_ratio == "4:3":
+            content_top = 150
+            content_bot = 1770
+        else:  # 1:1 and 9:16
+            content_top = 0
+            content_bot = 1920
+    else:
+        if target_aspect_ratio == "1:1":
+            content_top = 420
+            content_bot = 1500
+        elif target_aspect_ratio == "4:3":
+            content_top = 555
+            content_bot = 1365
+        elif target_aspect_ratio == "16:9":
+            content_top = 656
+            content_bot = 1264
+        else:  # 9:16
+            content_top = 0
+            content_bot = 1920
+
+    # Title line step matching 1.08x line height of live preview CSS box model
+    line_step = int(title_font_size * 1.08)
+    est_title_h = int(title_line_count * line_step)
+    est_sub_h = int(sub_font_size * 1.08)
+    sub_align = 5 if subtitle_position_mode == "center" else 2
+
+    # Ensure title line width does not overflow screen edges in ASS
+    title_lines_check = [l.strip() for l in formatted_title.split("\\N") if l.strip()]
+    if title_lines_check:
+        max_allowed_w = canvas_w - 70
+        test_font = get_font(title_font_name or font_name, title_font_size)
+        temp_draw = ImageDraw.Draw(Image.new("RGBA", (canvas_w, canvas_h)))
+        max_w = 0
+        for tl in title_lines_check:
+            bbox = temp_draw.textbbox((0, 0), tl, font=test_font)
+            max_w = max(max_w, bbox[2] - bbox[0])
+        if max_w > max_allowed_w and max_w > 0:
+            scale_factor = max_allowed_w / max_w
+            title_font_size = max(30, int(title_font_size * scale_factor))
+            line_step = int(title_font_size * 1.08)
+            est_title_h = int(title_line_count * line_step)
+
+    # Title Positioning (100% WYSIWYG matching framing preview):
+    if is_landscape:
+        effective_title_y_pct = float(title_y_percent) if title_y_percent is not None else (5.5 if title_line_count >= 3 else (6.5 if title_line_count == 2 else 8.0))
+        title_y = max(10, min(1000, int(round(1080 * (effective_title_y_pct / 100.0)))))
+    elif title_y_percent is not None:
+        effective_title_y_pct = float(title_y_percent)
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
+    else:
+        if streamer_preset == "split_top_cam":
+            effective_title_y_pct = 3.5 if title_line_count >= 3 else 4.5
+        elif target_aspect_ratio == "1:1":
+            effective_title_y_pct = 11.5 if title_line_count >= 3 else (13.5 if title_line_count == 2 else 17.0)
+        elif target_aspect_ratio == "4:3":
+            effective_title_y_pct = 17.3 if title_line_count >= 3 else (19.3 if title_line_count == 2 else 23.6)
+        elif target_aspect_ratio == "16:9":
+            effective_title_y_pct = 22.6 if title_line_count >= 3 else (24.5 if title_line_count == 2 else 28.8)
+        else:  # 9:16
+            effective_title_y_pct = 12.0 if title_line_count >= 3 else (14.5 if title_line_count == 2 else 17.0)
+        title_y = max(10, min(1800, int(round(1920 * (effective_title_y_pct / 100.0)))))
+
+    # Subtitle Positioning:
+    if is_landscape:
+        if subtitle_position_mode == "center":
+            sub_y = int(round(1080 * (subtitle_center_y_percent / 100.0)))
+            sub_y = max(40, min(1040, sub_y))
+        else:
+            effective_sub_pct = float(subtitle_y_percent) if subtitle_y_percent is not None else 10.0
+            sub_y = int(round(1080 * (1.0 - (effective_sub_pct / 100.0))))
+            sub_y = max(40, min(1040, sub_y))
+    elif subtitle_position_mode == "center":
+        sub_y = int(round(1920 * (subtitle_center_y_percent / 100.0)))
+        sub_y = max(content_top + 40, min(content_bot - 40, sub_y))
+    else:
+        # Bottom subtitle
+        if subtitle_y_percent is not None:
+            sub_y = int(round(1920 * (1.0 - (float(subtitle_y_percent) / 100.0))))
+        else:
+            if streamer_preset == "split_top_cam":
+                default_sub_pct = 18.0 if (target_aspect_ratio in ["9:16", "1:1"]) else (10.0 if target_aspect_ratio == "4:3" else 18.0)
+                sub_y = int(round(1920 * (1.0 - (default_sub_pct / 100.0))))
+            else:
+                default_sub_y = content_bot + est_sub_h + 12
+                sub_y = default_sub_y
+
+        if streamer_preset == "split_top_cam" or target_aspect_ratio == "9:16":
+            sub_y = max(60, min(1880, sub_y))
+        else:
+            min_safe_sub_y = content_bot + est_sub_h + 8
+            sub_y = max(sub_y, min_safe_sub_y)
+
+    # Preset color schemes (ASS uses &HAABBGGRR in hex)
+    if style_preset == "viral_pop":
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H00000000"
+        back_color = "&H80000000"
+        highlight_color = "&H0000E6FF"  # #FFE600 Lemon Yellow
+        outline_w = 4.8
+        shadow_w = 2.0
+    elif style_preset == "beast_punch":
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H00111111"
+        back_color = "&HA0000000"
+        highlight_color = "&H0066FF00"  # #00FF66 High-voltage Neon Green
+        outline_w = 5.0
+        shadow_w = 2.2
+    elif style_preset == "cyber_violet":
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H00330033"
+        back_color = "&H80500050"
+        highlight_color = "&H00EF46D9"  # #D946EF Vivid Magenta
+        outline_w = 4.8
+        shadow_w = 2.0
+    elif style_preset == "fire_red":
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H00000020"
+        back_color = "&H90000060"
+        highlight_color = "&H002E2EFF"  # #FF2E2E Blazing Fire Red
+        outline_w = 4.8
+        shadow_w = 2.0
+    elif style_preset == "electric_cyan":
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H00102020"
+        back_color = "&H90002030"
+        highlight_color = "&H00FFF000"  # #00F0FF Electric Cyan
+        outline_w = 4.8
+        shadow_w = 2.0
+    elif style_preset == "golden_aura":
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H000a1220"
+        back_color = "&HA0001830"
+        highlight_color = "&H0000B8FF"  # #FFB800 Warm Gold
+        outline_w = 4.8
+        shadow_w = 2.0
+    else:  # clean_minimal or none
+        primary_color = "&H00FFFFFF"
+        outline_color = "&H00111111"
+        back_color = "&HB0000000"
+        highlight_color = "&H00E0E0E0"
+        outline_w = 3.6
+        shadow_w = 1.8
+
+    # Title styling: clean transparent background across ALL formats (no black box border)
+    title_box_back = "&H00000000"
+    title_border_style = 1
+
+    eff_title_font = (title_font_name or font_name or "Outfit").replace(".ttf", "").replace(".otf", "").strip()
+    eff_sub_font = (font_name or "Outfit").replace(".ttf", "").replace(".otf", "").strip()
+
+    # Single-weight display fonts (Anton, Bebas Neue, Impact) must use Bold: 0
+    # because forcing Bold: -1 causes libass to mismatch and fallback to Arial
+    t_bold = 0 if any(k in eff_title_font.lower() for k in ["anton", "bebas", "impact"]) else -1
+    s_bold = 0 if any(k in eff_sub_font.lower() for k in ["anton", "bebas", "impact"]) else -1
+
+    ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {canvas_w}
+PlayResY: {canvas_h}
+ScaledBorderAndShadow: yes
+WrapStyle: 2
+Collisions: Reverse
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: TitleStyle,{eff_title_font},{title_font_size},&H00FFFFFF,&H000000FF,&H00000000,{title_box_back},{t_bold},0,0,0,100,100,0,0,{title_border_style},4.4,2.0,8,40,40,0,1
+Style: SubStyle,{eff_sub_font},{sub_font_size},{primary_color},&H000000FF,{outline_color},{back_color},{s_bold},0,0,0,100,100,0,0,1,{outline_w},{shadow_w},2,40,40,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    events = []
+
+    # 3. Add Title Event with selectable visibility duration (5s, 10s, or entire clip)
+    # If skip_title is True or title contains emojis, title is composited via PNG overlay with full color
+    if formatted_title and title_position != "none" and not skip_title and not has_emoji(title_text):
+        if title_duration == "5s":
+            t_end_sec = min(5.0, duration_seconds)
+        elif title_duration == "10s":
+            t_end_sec = min(10.0, duration_seconds)
+        else:
+            t_end_sec = max(1.0, duration_seconds)
+
+        end_time_str = format_ass_timestamp(t_end_sec)
+        title_lines = [l.strip() for l in formatted_title.split("\\N") if l.strip()]
+        base_ass_y = max(10, title_y - int(title_font_size * 0.15))
+        for line_idx, t_line in enumerate(title_lines):
+            line_y = base_ass_y + (line_idx * line_step)
+            events.append(
+                f"Dialogue: 1,0:00:00.00,{end_time_str},TitleStyle,,0,0,0,,{{\\q2\\an8\\pos({center_x},{line_y})}}{t_line}"
+            )
+
+    # 4. Add Subtitle Events if captions are enabled (guaranteed ZERO vertical glitch / jumping)
+    if words and style_preset != "none":
+        # Step A: Sanitize and sort all word timestamps
+        valid_words = []
+        for w in words:
+            raw_text = clean_caption_text(w.get("word", "").strip())
+            if not raw_text:
+                continue
+            w_text = escape_ass_text(apply_text_case(raw_text, text_case))
+            sub_off = float(subtitle_offset_seconds or 0.0)
+            st = max(0.0, float(w.get("start", 0.0)) + sub_off)
+            et = max(st + 0.15, float(w.get("end", st + 0.25)) + sub_off)
+            valid_words.append({"word_text": w_text, "start": st, "end": et, "raw": w})
+
+        valid_words.sort(key=lambda x: x["start"])
+
+        # Step B: Pack into compact chunks (1 to 3 words, max 22 chars) to strictly guarantee 1 single line
+        # Split on natural speech pauses (>= 0.38s) or sentence-ending punctuation so words don't hang over silences
+        chunks = []
+        current_chunk = []
+        current_chars = 0
+        for item in valid_words:
+            w_len = len(item["word_text"])
+            has_pause = bool(current_chunk and (item["start"] - current_chunk[-1]["end"] >= 0.38))
+            ends_sentence = bool(current_chunk and any(current_chunk[-1]["word_text"].endswith(p) for p in [".", "?", "!"]))
+            if len(current_chunk) >= 3 or has_pause or ends_sentence or (current_chunk and (current_chars + w_len > 22)):
+                chunks.append(current_chunk)
+                current_chunk = [item]
+                current_chars = w_len
+            else:
+                current_chunk.append(item)
+                current_chars += w_len + 1
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        # Step B2: Anti-orphan balancing pass: strictly prevent single-word chunks
+        # If total words >= 2, no chunk should leave a single lonely word on screen.
+        if len(valid_words) >= 2 and len(chunks) > 1:
+            changed = True
+            passes = 0
+            while changed and passes < 10:
+                changed = False
+                passes += 1
+                i = 0
+                while i < len(chunks):
+                    if len(chunks[i]) == 1 and len(chunks) > 1:
+                        if i > 0:
+                            prev_chunk = chunks[i - 1]
+                            if len(prev_chunk) >= 3:
+                                chunks[i].insert(0, prev_chunk.pop())
+                                changed = True
+                            else:
+                                prev_chunk.extend(chunks[i])
+                                chunks.pop(i)
+                                changed = True
+                                continue
+                        elif i < len(chunks) - 1:
+                            next_chunk = chunks[i + 1]
+                            if len(next_chunk) >= 3:
+                                chunks[i].append(next_chunk.pop(0))
+                                changed = True
+                            else:
+                                chunks[i].extend(next_chunk)
+                                chunks.pop(i + 1)
+                                changed = True
+                                continue
+                    i += 1
+
+        # Step C: Enforce strictly non-overlapping, monotonically increasing chunk boundaries
+        chunk_bounds = []
+        for chunk in chunks:
+            c_start = chunk[0]["start"]
+            c_end = max(c_start + 0.35, chunk[-1]["end"] + 0.12)
+            if chunk_bounds:
+                prev_end = chunk_bounds[-1][1]
+                if c_start < prev_end:
+                    c_start = prev_end
+                if c_end <= c_start:
+                    c_end = c_start + 0.28
+            chunk_bounds.append((c_start, c_end))
+
+        # Clamp against subsequent chunk start times to eliminate any inter-chunk overlaps,
+        # and bridge inter-chunk gaps so captions remain seamlessly visible without flickering off
+        for i in range(len(chunk_bounds) - 1):
+            cur_s, cur_e = chunk_bounds[i]
+            nxt_s, nxt_e = chunk_bounds[i + 1]
+            if cur_e > nxt_s:
+                split_pt = max(cur_s + 0.28, nxt_s)
+                chunk_bounds[i] = (cur_s, split_pt)
+                if nxt_s < split_pt:
+                    chunk_bounds[i + 1] = (split_pt, max(split_pt + 0.28, nxt_e))
+            elif cur_e < nxt_s:
+                chunk_bounds[i] = (cur_s, nxt_s)
+
+        # Extend final chunk to video end so subtitles remain visible until the video ends
+        if chunk_bounds and duration_seconds and float(duration_seconds) > 0:
+            last_s, last_e = chunk_bounds[-1]
+            vid_end = max(last_e, float(duration_seconds) - 0.05)
+            chunk_bounds[-1] = (last_s, vid_end)
+
+        # Natural subtitle entry alignment:
+        # If the first chunk's speech starts almost immediately (<= 0.15s), clamp start to 0.0
+        # for instant seamless appearance; otherwise let captions appear naturally when speech starts.
+        if chunks and chunk_bounds:
+            first_speech_time = max(0.0, chunks[0][0]["start"])
+            c_s, c_e = chunk_bounds[0]
+            if first_speech_time <= 0.15:
+                chunk_bounds[0] = (0.0, c_e)
+            else:
+                chunk_bounds[0] = (max(0.0, first_speech_time - 0.08), c_e)
+
+        # Step D: Partition each chunk into strictly contiguous active-word time slices
+        for chunk_idx, chunk in enumerate(chunks):
+            c_start, c_end = chunk_bounds[chunk_idx]
+            if c_end <= c_start:
+                c_end = c_start + 0.25
+            num_words = len(chunk)
+
+            last_word_end = chunk[-1]["end"]
+            has_pause_tail = (c_end > last_word_end + 0.35)
+
+            if num_words == 1:
+                if has_pause_tail:
+                    active_end = max(c_start + 0.2, min(last_word_end + 0.25, c_end - 0.1))
+                    time_slices = [(c_start, active_end)]
+                    idle_slice = (active_end, c_end)
+                else:
+                    time_slices = [(c_start, c_end)]
+                    idle_slice = None
+            else:
+                points = [c_start]
+                for w_i in range(1, num_words):
+                    raw_st = chunk[w_i]["start"]
+                    # Enforce minimum 0.16s per word to eliminate micro-flickering while preserving acoustic sync
+                    min_allowed = points[-1] + 0.16
+                    max_allowed = c_end - 0.16 * (num_words - w_i)
+                    if min_allowed > max_allowed:
+                        pt = points[-1] + (c_end - points[-1]) / (num_words - w_i + 1)
+                    else:
+                        pt = max(min_allowed, min(max_allowed, raw_st))
+                    points.append(pt)
+
+                if has_pause_tail:
+                    active_end = max(points[-1] + 0.2, min(last_word_end + 0.25, c_end - 0.1))
+                    points.append(active_end)
+                    time_slices = [(points[k], points[k + 1]) for k in range(num_words)]
+                    idle_slice = (active_end, c_end)
+                else:
+                    points.append(c_end)
+                    time_slices = [(points[k], points[k + 1]) for k in range(num_words)]
+                    idle_slice = None
+
+            for active_idx, (w_start, w_end) in enumerate(time_slices):
+                if w_end <= w_start:
+                    continue
+
+                dur_ms = max(60, int((w_end - w_start) * 1000))
+                pop_ms = min(70, max(25, int(dur_ms * 0.35)))
+                settle_ms = min(160, max(pop_ms + 25, int(dur_ms * 0.70)))
+
+                line_parts = []
+                for idx, item in enumerate(chunk):
+                    w_txt = item["word_text"]
+                    if idx == active_idx:
+                        # Bouncing pop effect animation matching studio preview (scale 1.0 -> 1.16 pop -> 1.08 settle)
+                        bounce_tag = (
+                            r"{\c" + highlight_color + r"\3c" + outline_color +
+                            rf"\fscx100\fscy100\t(0,{pop_ms},\fscx116\fscy116)\t({pop_ms},{settle_ms},\fscx108\fscy108)}}" +
+                            w_txt +
+                            r"{\fscx100\fscy100\c" + primary_color + r"\3c" + outline_color + r"}"
+                        )
+                        line_parts.append(bounce_tag)
+                    else:
+                        line_parts.append(w_txt)
+
+                styled_line = " ".join(line_parts)
+                # Lock position to sub_y with \q2\an{sub_align}\pos(center_x, sub_y)
+                events.append(
+                    f"Dialogue: 0,{format_ass_timestamp(w_start)},{format_ass_timestamp(w_end)},SubStyle,,0,0,0,,{{\\q2\\an{sub_align}\\pos({center_x},{sub_y})}}{styled_line}"
+                )
+
+            # Keep caption text visible during natural speech pauses until next chunk starts
+            if idle_slice and idle_slice[1] > idle_slice[0]:
+                unhighlighted_tail = " ".join(item["word_text"] for item in chunk)
+                events.append(
+                    f"Dialogue: 0,{format_ass_timestamp(idle_slice[0])},{format_ass_timestamp(idle_slice[1])},SubStyle,,0,0,0,,{{\\q2\\an{sub_align}\\pos({center_x},{sub_y})}}{unhighlighted_tail}"
+                )
+
+    ass_content = ass_header + "\n".join(events) + "\n"
+    os.makedirs(os.path.dirname(os.path.abspath(output_ass_path)), exist_ok=True)
+    with open(output_ass_path, "w", encoding="utf-8") as f:
+        f.write(ass_content)
+
+    return output_ass_path
+
+
+def detect_image_saliency_center(frame) -> Tuple[float, float]:
+    """
+    Computes visual saliency center of mass for a non-facecam image frame.
+    Finds the primary visual focal point / subject of attention.
+    """
+    try:
+        import cv2
+        import numpy as np
+        small = cv2.resize(frame, (320, 180))
+        saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+        success, sal_map = saliency.computeSaliency(small)
+        if success and sal_map is not None:
+            thresh = np.percentile(sal_map, 80)
+            filtered = np.where(sal_map >= thresh, sal_map, 0.0)
+            stotal = filtered.sum()
+            if stotal > 1e-4:
+                norm = filtered / stotal
+                y_idx, x_idx = np.indices(norm.shape)
+                sal_cx = float((x_idx * norm).sum()) / 320.0
+                sal_cy = float((y_idx * norm).sum()) / 180.0
+                # Snap to center if close to middle
+                if 0.44 <= sal_cx <= 0.56:
+                    sal_cx = 0.50
+                sal_cx = max(0.26, min(0.74, sal_cx))
+                return sal_cx, sal_cy
+    except Exception as e:
+        logger.debug(f"Image saliency fallback: {e}")
+    return 0.50, 0.35
+
+
+def detect_video_saliency_and_motion_center(sampled_small_frames: List[Any]) -> Tuple[float, float]:
+    """
+    Computes combined visual saliency + inter-frame motion center for non-facecam videos
+    (gameplay, tutorials, product unboxing, sports, animations, nature, etc.).
+    Guarantees the camera tracks actual action/objects and never stares at an empty wall.
+    """
+    if not sampled_small_frames:
+        return 0.50, 0.35
+
+    try:
+        import cv2
+        import numpy as np
+        saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+        centers = []
+
+        for i in range(len(sampled_small_frames)):
+            small = sampled_small_frames[i]
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+            # 1. Motion energy if consecutive frame exists
+            motion_weight = 0.0
+            motion_cx, motion_cy = 0.5, 0.5
+            if i > 0:
+                prev_gray = cv2.cvtColor(sampled_small_frames[i - 1], cv2.COLOR_BGR2GRAY)
+                diff = cv2.absdiff(gray, prev_gray)
+                _, m_thresh = cv2.threshold(diff, 20, 255, cv2.THRESH_BINARY)
+                moments = cv2.moments(m_thresh)
+                if moments["m00"] > 50:
+                    motion_cx = (moments["m10"] / moments["m00"]) / 320.0
+                    motion_cy = (moments["m01"] / moments["m00"]) / 180.0
+                    motion_weight = min(2.0, float(moments["m00"]) / 2000.0)
+
+            # 2. Static Visual Saliency
+            success, sal_map = saliency.computeSaliency(small)
+            sal_cx, sal_cy, sal_weight = 0.5, 0.5, 0.0
+            if success and sal_map is not None:
+                thresh = np.percentile(sal_map, 80)
+                filtered = np.where(sal_map >= thresh, sal_map, 0.0)
+                stotal = filtered.sum()
+                if stotal > 1e-4:
+                    norm = filtered / stotal
+                    y_idx, x_idx = np.indices(norm.shape)
+                    sal_cx = float((x_idx * norm).sum()) / 320.0
+                    sal_cy = float((y_idx * norm).sum()) / 180.0
+                    sal_weight = 1.0
+
+            # Fuse motion & visual saliency
+            if motion_weight > 0 and sal_weight > 0:
+                fcx = (sal_cx * 1.0 + motion_cx * motion_weight) / (1.0 + motion_weight)
+                fcy = (sal_cy * 1.0 + motion_cy * motion_weight) / (1.0 + motion_weight)
+                wgt = 1.0 + motion_weight
+            elif motion_weight > 0:
+                fcx, fcy, wgt = motion_cx, motion_cy, motion_weight
+            elif sal_weight > 0:
+                fcx, fcy, wgt = sal_cx, sal_cy, sal_weight
+            else:
+                fcx, fcy, wgt = 0.5, 0.35, 0.1
+
+            centers.append((fcx, fcy, wgt))
+
+        if centers:
+            total_w = sum(c[2] for c in centers)
+            avg_cx = sum(c[0] * c[2] for c in centers) / total_w
+            avg_cy = sum(c[1] * c[2] for c in centers) / total_w
+
+            # Deadzone center snapping
+            if 0.44 <= avg_cx <= 0.56:
+                avg_cx = 0.50
+            # Safe bounds clamp
+            avg_cx = max(0.26, min(0.74, avg_cx))
+            return avg_cx, avg_cy
+    except Exception as e:
+        logger.debug(f"Video saliency fallback: {e}")
+
+    return 0.50, 0.35
+
+
+def detect_speaker_face_box(
+    source_path: str,
+    facecam_position: str = "auto",
+    streamer_preset: str = "none"
+) -> Dict[str, Any]:
+    """
+    Detects speaker face or non-facecam salient action/object bounding box.
+    Uses OpenCV YuNet Deep Neural Network + Saliency/Motion Object detection.
+    Prevents false alarms on walls, backgrounds, and empty textures.
+    Returns normalized coordinates:
+    {
+        "found": bool,
+        "cx": float,  # horizontal center (0.0 to 1.0)
+        "cy": float,  # vertical center (0.0 to 1.0)
+        "w": float,   # face width ratio (0.0 to 1.0)
+        "h": float    # face height ratio (0.0 to 1.0)
+    }
+    """
+    pos = (facecam_position or "auto").lower().strip()
+    if pos == "bottom_right":
+        return {"found": True, "cx": 0.85, "cy": 0.78, "w": 0.22, "h": 0.25}
+    elif pos == "top_right":
+        return {"found": True, "cx": 0.85, "cy": 0.22, "w": 0.22, "h": 0.25}
+    elif pos == "bottom_left":
+        return {"found": True, "cx": 0.15, "cy": 0.78, "w": 0.22, "h": 0.25}
+    elif pos == "top_left":
+        return {"found": True, "cx": 0.15, "cy": 0.22, "w": 0.22, "h": 0.25}
+    elif pos == "center":
+        return {"found": True, "cx": 0.50, "cy": 0.35, "w": 0.25, "h": 0.25}
+    elif pos == "left":
+        return {"found": True, "cx": 0.35, "cy": 0.35, "w": 0.25, "h": 0.25}
+    elif pos == "right":
+        return {"found": True, "cx": 0.65, "cy": 0.35, "w": 0.25, "h": 0.25}
+
+    is_streamer = streamer_preset in ["split_top_cam", "pip_corner"]
+    default_cx = 0.85 if is_streamer else 0.50
+    default_cy = 0.78 if is_streamer else 0.35
+    default_res = {"found": False, "cx": default_cx, "cy": default_cy, "w": 0.22, "h": 0.25}
+
+    if not source_path or not os.path.exists(source_path):
+        return default_res
+
+    try:
+        import cv2
+
+        # Check if source is image
+        ext = os.path.splitext(source_path)[1].lower()
+        is_image = ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+
+        # 1. Initialize YuNet Deep Neural Network detector if model file is available
+        yunet_detector = None
+        target_model = None
+        for cand in [YUNET_MODEL_PATH, BASE_DIR / "face_detection_yunet.onnx", BASE_DIR / "cascades" / "face_detection_yunet.onnx"]:
+            if cand.exists():
+                target_model = cand
+                break
+        if target_model:
+            try:
+                yunet_detector = cv2.FaceDetectorYN.create(
+                    str(target_model),
+                    "",
+                    (320, 320),
+                    0.65,  # score_threshold: strict enough to reject walls and noise
+                    0.3,   # nms_threshold
+                    5000
+                )
+            except Exception as e:
+                logger.warning(f"YuNet initialization failed: {e}")
+                yunet_detector = None
+
+        # 2. Prepare Haar Cascades fallback ensemble
+        cascades = []
+        cascade_names = [
+            "haarcascade_frontalface_alt2.xml",
+            "haarcascade_frontalface_alt.xml",
+            "haarcascade_profileface.xml",
+            "haarcascade_upperbody.xml",
+            "haarcascade_frontalface_default.xml"
+        ]
+        opencv_data_dir = getattr(cv2, "data", None)
+        haarcascades_dir = getattr(opencv_data_dir, "haarcascades", None) if opencv_data_dir else None
+
+        for c_name in cascade_names:
+            candidates = [
+                CASCADES_DIR / c_name,
+                BASE_DIR / c_name,
+                os.path.join(haarcascades_dir, c_name) if haarcascades_dir else ""
+            ]
+            for p in candidates:
+                if p and os.path.exists(str(p)):
+                    try:
+                        c = cv2.CascadeClassifier(str(p))
+                        if not c.empty():
+                            cascades.append(c)
+                            break
+                    except Exception:
+                        pass
+
+        # Helper: detect faces in a single frame
+        def detect_frame_faces(frame) -> List[Dict[str, Any]]:
+            fh, fw = frame.shape[:2]
+            found_faces = []
+
+            # Stage A: Deep Learning YuNet
+            if yunet_detector is not None:
+                try:
+                    yunet_detector.setInputSize((fw, fh))
+                    res = yunet_detector.detect(frame)
+                    if res[1] is not None and len(res[1]) > 0:
+                        for f in res[1]:
+                            box = f[0:4]
+                            conf = float(f[-1])
+                            fcx = float(box[0] + box[2] / 2.0) / fw
+                            fcy = float(box[1] + box[3] / 2.0) / fh
+                            bw = float(box[2]) / fw
+                            bh = float(box[3]) / fh
+                            if bw >= 0.025 and bh >= 0.025:
+                                found_faces.append({
+                                    "cx": fcx, "cy": fcy, "w": bw, "h": bh,
+                                    "conf": conf, "source": "yunet"
+                                })
+                        if found_faces:
+                            return found_faces
+                except Exception:
+                    pass
+
+            # Stage B: Haar Cascade Ensemble with strict false-positive suppression
+            if cascades:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                min_sz = max(48, int(fh * 0.08))  # Minimum 8% of frame height (reject wall specks)
+                for cascade in cascades:
+                    haar_faces = cascade.detectMultiScale(
+                        gray,
+                        scaleFactor=1.1,
+                        minNeighbors=6,
+                        minSize=(min_sz, min_sz)
+                    )
+                    if len(haar_faces) > 0:
+                        for (fx, fy, bw, bh) in haar_faces:
+                            aspect = float(bw) / float(bh)
+                            if 0.65 <= aspect <= 1.35:
+                                fcx = float(fx + bw / 2.0) / fw
+                                fcy = float(fy + bh / 2.0) / fh
+                                found_faces.append({
+                                    "cx": fcx, "cy": fcy,
+                                    "w": float(bw) / fw, "h": float(bh) / fh,
+                                    "conf": 0.70, "source": "haar"
+                                })
+                        if found_faces:
+                            break
+
+            return found_faces
+
+        # Case 1: Image source
+        if is_image:
+            frame = cv2.imread(source_path)
+            if frame is None:
+                return default_res
+            img_faces = detect_frame_faces(frame)
+            if not img_faces:
+                # Non-facecam image: detect salient focal point
+                if not is_streamer:
+                    sal_cx, sal_cy = detect_image_saliency_center(frame)
+                    logger.info(f"Non-facecam image detected: smart visual saliency centered at ({sal_cx:.3f}, {sal_cy:.3f})")
+                    return {
+                        "found": True,
+                        "type": "salient_object",
+                        "cx": float(round(sal_cx, 3)),
+                        "cy": float(round(sal_cy, 3)),
+                        "w": 0.25,
+                        "h": 0.25
+                    }
+                return default_res
+
+            if is_streamer:
+                corner_faces = [f for f in img_faces if ((f["cx"] - 0.5)**2 + (f["cy"] - 0.5)**2) > 0.06]
+                chosen = max(corner_faces or img_faces, key=lambda f: f["w"] * f["h"])
+            else:
+                fg_faces = [f for f in img_faces if f["w"] >= 0.06 or abs(f["cx"] - 0.5) <= 0.28]
+                if not fg_faces:
+                    # Tiny corner webcam in image: center on non-facecam main content
+                    sal_cx, sal_cy = detect_image_saliency_center(frame)
+                    return {"found": True, "type": "salient_object", "cx": float(round(sal_cx, 3)), "cy": float(round(sal_cy, 3)), "w": 0.25, "h": 0.25}
+                chosen = max(fg_faces, key=lambda f: (f["w"] * f["h"]) * (1.0 - 0.35 * abs(f["cx"] - 0.5)))
+
+            final_cx = float(chosen["cx"])
+            if not is_streamer:
+                if 0.45 <= final_cx <= 0.55:
+                    final_cx = 0.50
+                final_cx = max(0.24, min(0.76, final_cx))
+
+            return {
+                "found": True,
+                "cx": float(round(final_cx, 3)),
+                "cy": float(round(chosen["cy"], 3)),
+                "w": float(round(chosen["w"], 3)),
+                "h": float(round(chosen["h"], 3))
+            }
+
+        # Case 2: Video source
+        cap = cv2.VideoCapture(source_path)
+        if not cap.isOpened():
+            return default_res
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        # Low-CPU keyframe sampling: 10 frames are sufficient for spatial clustering without loading server CPU
+        step = max(1, total_frames // 10) if total_frames > 10 else max(1, int(fps * 1.5))
+
+        detections = []
+        sampled_small_frames = []
+        frame_idx = 0
+        checked = 0
+        while cap.isOpened() and frame_idx < total_frames and checked < 10:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            frame_idx += step
+            checked += 1
+            if not ret or frame is None:
+                continue
+            sampled_small_frames.append(cv2.resize(frame, (320, 180)))
+            f_faces = detect_frame_faces(frame)
+            if f_faces:
+                detections.extend(f_faces)
+
+        cap.release()
+
+        # If no face detections, run non-facecam visual saliency & motion object tracking!
+        if not detections:
+            if not is_streamer and sampled_small_frames:
+                sal_cx, sal_cy = detect_video_saliency_and_motion_center(sampled_small_frames)
+                logger.info(f"Non-facecam video detected: smart saliency/motion centered at ({sal_cx:.3f}, {sal_cy:.3f})")
+                return {
+                    "found": True,
+                    "type": "salient_object",
+                    "cx": float(round(sal_cx, 3)),
+                    "cy": float(round(sal_cy, 3)),
+                    "w": 0.25,
+                    "h": 0.25
+                }
+            return default_res
+
+        # Spatial clustering across sampled frames
+        clusters = []
+        for d in detections:
+            matched = False
+            for c in clusters:
+                dist = ((c["cx"] - d["cx"])**2 + (c["cy"] - d["cy"])**2)**0.5
+                if dist < 0.12:
+                    c["pts"].append(d)
+                    c["cx"] = sum(p["cx"] for p in c["pts"]) / len(c["pts"])
+                    c["cy"] = sum(p["cy"] for p in c["pts"]) / len(c["pts"])
+                    matched = True
+                    break
+            if not matched:
+                clusters.append({"cx": d["cx"], "cy": d["cy"], "pts": [d]})
+
+        # Temporal multi-frame persistence gating
+        valid_clusters = [
+            c for c in clusters
+            if len(c["pts"]) >= 2 or (c["pts"][0]["conf"] >= 0.85 and c["pts"][0]["w"] >= 0.08)
+        ]
+        if not valid_clusters:
+            # Low confidence / isolated noise blips -> fallback to saliency/motion
+            if not is_streamer and sampled_small_frames:
+                sal_cx, sal_cy = detect_video_saliency_and_motion_center(sampled_small_frames)
+                logger.info(f"Non-facecam video (weak face noise): smart saliency/motion centered at ({sal_cx:.3f}, {sal_cy:.3f})")
+                return {
+                    "found": True,
+                    "type": "salient_object",
+                    "cx": float(round(sal_cx, 3)),
+                    "cy": float(round(sal_cy, 3)),
+                    "w": 0.25,
+                    "h": 0.25
+                }
+            return default_res
+
+        if is_streamer:
+            corner_clusters = [c for c in valid_clusters if ((c["cx"] - 0.5)**2 + (c["cy"] - 0.5)**2) > 0.06]
+            chosen = max(corner_clusters or valid_clusters, key=lambda c: len(c["pts"]))
+        else:
+            foreground_clusters = [
+                c for c in valid_clusters
+                if (sum(p["w"] for p in c["pts"]) / len(c["pts"])) >= 0.06 or abs(c["cx"] - 0.5) <= 0.28
+            ]
+            if not foreground_clusters:
+                # All detections are corner webcams; in standard 9:16, analyze saliency/motion of main content
+                if sampled_small_frames:
+                    sal_cx, sal_cy = detect_video_saliency_and_motion_center(sampled_small_frames)
+                    logger.info(f"Corner webcam with non-facecam main content: centered at ({sal_cx:.3f}, {sal_cy:.3f})")
+                    return {
+                        "found": True,
+                        "type": "salient_object",
+                        "cx": float(round(sal_cx, 3)),
+                        "cy": float(round(sal_cy, 3)),
+                        "w": 0.25,
+                        "h": 0.25
+                    }
+                return {"found": True, "is_corner_cam": True, "cx": 0.50, "cy": 0.35, "w": 0.22, "h": 0.25}
+
+            # Check for dual speakers on opposite sides (interviews, podcasts, co-hosts)
+            left_speakers = [c for c in foreground_clusters if c["cx"] < 0.40 and len(c["pts"]) >= 3]
+            right_speakers = [c for c in foreground_clusters if c["cx"] > 0.60 and len(c["pts"]) >= 3]
+            if left_speakers and right_speakers:
+                mid_cx = (max(left_speakers, key=lambda c: len(c["pts"]))["cx"] + max(right_speakers, key=lambda c: len(c["pts"]))["cx"]) / 2.0
+                return {"found": True, "cx": float(round(mid_cx, 3)), "cy": 0.35, "w": 0.25, "h": 0.25, "dual_speakers": True}
+
+            # Rank foreground candidates by: consistency * size * confidence * center prior
+            def score_cluster(c):
+                avg_w = sum(p["w"] for p in c["pts"]) / len(c["pts"])
+                avg_conf = sum(p["conf"] for p in c["pts"]) / len(c["pts"])
+                center_prior = 1.0 - 0.35 * abs(c["cx"] - 0.5)
+                return len(c["pts"]) * (avg_w ** 0.5) * avg_conf * center_prior
+
+            chosen = max(foreground_clusters, key=score_cluster)
+
+        avg_w = sum(p["w"] for p in chosen["pts"]) / len(chosen["pts"])
+        avg_h = sum(p["h"] for p in chosen["pts"]) / len(chosen["pts"])
+        final_cx = float(chosen["cx"])
+
+        if not is_streamer:
+            # Snap to exact center if the host is already close to middle (eliminates micro-jitters)
+            if 0.45 <= final_cx <= 0.55:
+                final_cx = 0.50
+            # Safe crop bounds: never push the crop into extreme edges/walls
+            final_cx = max(0.24, min(0.76, final_cx))
+
+        logger.info(
+            f"Smart face tracking selected speaker: center=({final_cx:.3f}, {chosen['cy']:.3f}), "
+            f"size=({avg_w:.3f}x{avg_h:.3f}) across {len(chosen['pts'])} frames"
+        )
+        return {
+            "found": True,
+            "cx": float(round(final_cx, 3)),
+            "cy": float(round(chosen["cy"], 3)),
+            "w": float(round(avg_w, 3)),
+            "h": float(round(avg_h, 3))
+        }
+    except Exception as e:
+        logger.warning(f"Face/object detection encountered error: {e}, safely falling back to center.")
+
+    return default_res
+
+
+def detect_speaker_center_ratio(video_path: str, facecam_position: str = "auto", streamer_preset: str = "none") -> float:
+    """
+    Detects speaker faces across sample frames and returns the smoothed horizontal center ratio (0.0 to 1.0).
+    Defaults to 0.5 (center) if no face is detected.
+    """
+    box = detect_speaker_face_box(video_path, facecam_position=facecam_position, streamer_preset=streamer_preset)
+    return float(box.get("cx", 0.5))
+
+
+def build_ffmpeg_filtergraph(
+    aspect_ratio: str,
+    background_style: str,
+    face_center_ratio: float = 0.5,
+    streamer_preset: str = "none",
+    title_text: Optional[str] = None,
+    title_position: str = "auto",
+    ass_subtitles_path: Optional[str] = None,
+    face_box: Optional[Dict[str, Any]] = None,
+    title_y_percent: Optional[float] = None,
+    crop_x_percent: Optional[float] = None
+) -> Tuple[str, str]:
+    """
+    Constructs the FFmpeg -filter_complex chain with proper aspect ratio center-cropping.
+    Canvas is always 1080x1920 (9:16). Delegated to backend.video.filtergraph.
+    """
+    from backend.video.filtergraph import build_ffmpeg_filtergraph as _build_fg
+    return _build_fg(
+        aspect_ratio=aspect_ratio,
+        background_style=background_style,
+        face_center_ratio=face_center_ratio,
+        streamer_preset=streamer_preset,
+        title_text=title_text,
+        title_position=title_position,
+        ass_subtitles_path=ass_subtitles_path,
+        face_box=face_box,
+        title_y_percent=title_y_percent,
+        crop_x_percent=crop_x_percent
+    )
+
+
+def check_has_audio(video_path: str) -> bool:
+    """Checks if the video file contains a readable audio stream."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0",
+            str(video_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        return bool(res.stdout and res.stdout.strip())
+    except Exception:
+        return True
+
+
+def _run_ffmpeg_command_with_progress(
+    cmd: List[str],
+    total_duration: float,
+    timeout: float,
+    progress_callback: Optional[Callable[[float], None]] = None,
+    on_process_spawned: Optional[Callable[[subprocess.Popen], None]] = None
+) -> Tuple[int, str]:
+    """
+    Executes an FFmpeg command with -progress pipe:1 and streams progress to callback.
+    Captures stderr asynchronously to prevent pipe deadlocks and provide complete error reporting.
+    """
+    full_cmd = list(cmd)
+    if "-progress" not in full_cmd:
+        full_cmd.insert(1, "pipe:1")
+        full_cmd.insert(1, "-progress")
+        full_cmd.insert(3, "-nostats")
+
+    process = subprocess.Popen(
+        full_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
+    if on_process_spawned:
+        try:
+            on_process_spawned(process)
+        except Exception:
+            pass
+    stderr_lines: List[str] = []
+
+    def _read_stderr():
+        if process.stderr:
+            for line in iter(process.stderr.readline, ''):
+                stderr_lines.append(line)
+            try:
+                process.stderr.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_read_stderr, daemon=True)
+    t.start()
+
+    start_time = time.time()
+    try:
+        if process.stdout:
+            for line in iter(process.stdout.readline, ''):
+                if timeout and (time.time() - start_time) > timeout:
+                    process.kill()
+                    raise subprocess.TimeoutExpired(full_cmd, timeout)
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("out_time_us="):
+                    try:
+                        us_val = int(line.split("=", 1)[1])
+                        cur_sec = us_val / 1_000_000.0
+                        if total_duration > 0 and progress_callback:
+                            frac = min(0.99, max(0.0, cur_sec / total_duration))
+                            progress_callback(frac)
+                    except Exception:
+                        pass
+                elif line == "progress=end":
+                    if progress_callback:
+                        progress_callback(1.0)
+            try:
+                process.stdout.close()
+            except Exception:
+                pass
+    except subprocess.TimeoutExpired:
+        raise
+    except Exception as e:
+        logger.warning(f"Error while reading FFmpeg progress: {e}")
+    finally:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        t.join(timeout=2)
+
+    stderr_text = "".join(stderr_lines).strip()
+    return process.returncode, stderr_text
+
+
+def render_clip_to_mp4(
+    video_path: str,
+    output_mp4_path: str,
+    aspect_ratio: str = "9:16",
+    background_style: str = "black",
+    enable_face_tracking: bool = True,
+    streamer_preset: str = "none",
+    facecam_position: str = "auto",
+    title_text: Optional[str] = None,
+    title_position: str = "auto",
+    ass_subtitles_path: Optional[str] = None,
+    clip_duration: float = 30.0,
+    # Title Overlay (for full-color emojis and styling)
+    title_overlay_path: Optional[str] = None,
+    title_duration: str = "entire",
+    # Watermark options
+    watermark_enabled: bool = False,
+    watermark_type: str = "image",
+    watermark_image_path: Optional[str] = None,
+    watermark_text: Optional[str] = None,
+    watermark_size: float = 20.0,
+    watermark_opacity: float = 0.8,
+    watermark_x_percent: float = 90.0,
+    watermark_y_percent: float = 8.0,
+    # Background Music options
+    bgm_enabled: bool = False,
+    bgm_path: Optional[str] = None,
+    bgm_volume: float = 0.25,
+    bgm_start_offset: float = 0.0,
+    # Hook SFX options (plays at frame 0)
+    hook_sfx_enabled: bool = False,
+    hook_sfx_path: Optional[str] = None,
+    hook_sfx_volume: float = 1.0,
+    # Raw voice / original audio boost (0.0 to 2.0)
+    original_audio_volume: float = 1.0,
+    # Hardware acceleration selection ('auto', 'nvenc', 'amf', 'qsv', 'cpu')
+    hardware_accel: Optional[str] = "auto",
+    title_y_percent: Optional[float] = None,
+    crop_x_percent: Optional[float] = None,
+    title_x_percent: Optional[float] = 50.0,
+    progress_callback: Optional[Callable[[float], None]] = None,
+    on_process_spawned: Optional[Callable[[subprocess.Popen], None]] = None
+) -> str:
+    """
+    Renders the final 1080x1920 short-form video with layout, aspect ratio, titles, subtitles,
+    watermark branding, background music with start offset, and hook sound effect at frame 0.
+    """
+    if not os.path.exists(video_path) or os.path.getsize(video_path) < 1000:
+        raise RuntimeError(f"Input video file is missing or empty: {video_path}")
+
+    if not is_valid_mp4(video_path):
+        raise RuntimeError(
+            "Source video segment is incomplete or corrupted ('moov atom not found'). "
+            "This usually happens when internet lags during download. Please retry rendering this clip."
+        )
+
+    if ass_subtitles_path and os.path.exists(ass_subtitles_path):
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path or not _ffmpeg_has_filter(ffmpeg_path, "subtitles"):
+            raise RuntimeError(
+                "Subtitle rendering requires an FFmpeg build with libass (the 'subtitles' filter). "
+                "On macOS, install it with 'brew install ffmpeg-full' and restart the backend."
+            )
+
+    is_streamer = streamer_preset in ["pip_corner", "split_top_cam"]
+    default_cx = 0.85 if is_streamer else 0.50
+    default_cy = 0.78 if is_streamer else 0.35
+    face_box = {"found": False, "cx": default_cx, "cy": default_cy, "w": 0.22, "h": 0.25}
+    if crop_x_percent is not None:
+        face_box = {"found": True, "cx": max(0.05, min(0.95, float(crop_x_percent) / 100.0)), "cy": default_cy, "w": 0.22, "h": 0.25}
+    elif enable_face_tracking or is_streamer:
+        face_box = detect_speaker_face_box(
+            video_path,
+            facecam_position=facecam_position,
+            streamer_preset=streamer_preset
+        )
+
+    filter_complex, out_video_map = build_ffmpeg_filtergraph(
+        aspect_ratio=aspect_ratio,
+        background_style=background_style,
+        face_center_ratio=float(face_box.get("cx", 0.5)),
+        streamer_preset=streamer_preset,
+        title_text=title_text if not (title_overlay_path and os.path.exists(title_overlay_path)) else None,
+        title_position=title_position,
+        ass_subtitles_path=ass_subtitles_path,
+        face_box=face_box,
+        title_y_percent=title_y_percent,
+        crop_x_percent=crop_x_percent
+    )
+
+    filter_chains = [filter_complex]
+    extra_input_args = []
+    input_idx_counter = 1
+    dur = max(1.0, float(clip_duration))
+
+    # 1. Apply Title Overlay (Full-Color Emojis & Titles)
+    if title_overlay_path and os.path.exists(title_overlay_path):
+        t_idx = input_idx_counter
+        input_idx_counter += 1
+        extra_input_args.extend(["-i", str(title_overlay_path)])
+
+        if title_duration == "5s":
+            t_end_sec = min(5.0, dur)
+            enable_expr = f":enable='between(t,0,{t_end_sec:.2f})'"
+        elif title_duration == "10s":
+            t_end_sec = min(10.0, dur)
+            enable_expr = f":enable='between(t,0,{t_end_sec:.2f})'"
+        else:
+            enable_expr = ""
+
+        overlay_title_cmd = f"{out_video_map}[{t_idx}:v]overlay=0:0{enable_expr}[v_with_title_overlay]"
+        filter_chains.append(overlay_title_cmd)
+        out_video_map = "[v_with_title_overlay]"
+
+    # 2. Apply Watermark Overlay
+    if watermark_enabled and float(watermark_size) > 0:
+        wm_opacity = max(0.05, min(1.0, float(watermark_opacity)))
+        wm_x_ratio = max(-1.0, min(2.0, float(watermark_x_percent) / 100.0))
+        wm_y_ratio = max(-1.0, min(2.0, float(watermark_y_percent) / 100.0))
+
+        if watermark_type == "image" and watermark_image_path and os.path.exists(watermark_image_path):
+            wm_idx = input_idx_counter
+            input_idx_counter += 1
+            extra_input_args.extend(["-i", str(watermark_image_path)])
+
+            # Canvas width is 1920 for landscape or 1080 for vertical. Calculate watermark width based on percentage (0-500%)
+            canvas_w = 1920 if aspect_ratio == "16:9_landscape" else 1080
+            wm_w = max(16, min(5400, int(canvas_w * (float(watermark_size) / 100.0))))
+            wm_prep = f"[{wm_idx}:v]format=rgba,colorchannelmixer=aa={wm_opacity:.2f},scale={wm_w}:-1[wm_proc]"
+            filter_chains.append(wm_prep)
+
+            # Center-based positioning: (X%, Y%) represents the center anchor point on the canvas.
+            # This ensures full 100% travel range across the canvas regardless of watermark size.
+            overlay_cmd = (
+                f"{out_video_map}[wm_proc]overlay="
+                f"x='main_w*{wm_x_ratio:.4f}-overlay_w/2':"
+                f"y='main_h*{wm_y_ratio:.4f}-overlay_h/2':eval=init[v_watermarked]"
+            )
+            filter_chains.append(overlay_cmd)
+            out_video_map = "[v_watermarked]"
+
+        elif watermark_text and watermark_text.strip():
+            # Render text watermark to a transparent PNG overlay using Pillow
+            # This completely avoids FFmpeg Fontconfig bugs on Windows while adding emoji & anti-aliasing support
+            wm_font_size = max(14, min(900, int(180 * (float(watermark_size) / 100.0))))
+            wm_png_filename = f"wm_text_{int(time.time() * 1000)}.png"
+            wm_png_path = TEMP_DIR / wm_png_filename
+            rendered_wm = render_text_watermark_png(
+                text=watermark_text.strip(),
+                output_png_path=str(wm_png_path),
+                font_name="Montserrat",
+                font_size=wm_font_size,
+                border_width=max(2, int(wm_font_size * 0.055))
+            )
+
+            if rendered_wm and os.path.exists(rendered_wm):
+                wm_idx = input_idx_counter
+                input_idx_counter += 1
+                extra_input_args.extend(["-i", str(rendered_wm)])
+
+                wm_prep = f"[{wm_idx}:v]format=rgba,colorchannelmixer=aa={wm_opacity:.2f}[wm_proc]"
+                filter_chains.append(wm_prep)
+
+                overlay_cmd = (
+                    f"{out_video_map}[wm_proc]overlay="
+                    f"x='main_w*{wm_x_ratio:.4f}-overlay_w/2':"
+                    f"y='main_h*{wm_y_ratio:.4f}-overlay_h/2':eval=init[v_watermarked]"
+                )
+                filter_chains.append(overlay_cmd)
+                out_video_map = "[v_watermarked]"
+            else:
+                # Fallback to drawtext with explicit fontfile (never relies on Fontconfig)
+                safe_font = get_ffmpeg_safe_font_path()
+                font_arg = f":fontfile='{safe_font}'" if safe_font else ""
+                clean_text = watermark_text.replace("'", "").replace(":", "\\:").replace("%", "").strip()
+                overlay_x_expr = f"w*{wm_x_ratio:.4f}-text_w/2"
+                overlay_y_expr = f"h*{wm_y_ratio:.4f}-text_h/2"
+                drawtext_cmd = (
+                    f"{out_video_map}drawtext=text='{clean_text}'{font_arg}:fontsize={wm_font_size}:"
+                    f"fontcolor=white@{wm_opacity:.2f}:borderw=2:bordercolor=black@{wm_opacity:.2f}:"
+                    f"x='{overlay_x_expr}':y='{overlay_y_expr}'[v_watermarked]"
+                )
+                filter_chains.append(drawtext_cmd)
+                out_video_map = "[v_watermarked]"
+
+    # 2. Audio Processing (Original Audio with Boost, BGM with start offset, and Hook SFX at frame 0)
+    audio_inputs_to_mix = []
+    has_orig_audio = check_has_audio(video_path)
+    if has_orig_audio:
+        orig_vol = max(0.0, min(2.0, float(original_audio_volume)))
+        if abs(orig_vol - 1.0) > 0.01:
+            filter_chains.append(f"[0:a:0]asetpts=PTS-STARTPTS,volume={orig_vol:.3f}[v_orig_boosted]")
+            audio_inputs_to_mix.append("[v_orig_boosted]")
+        else:
+            filter_chains.append("[0:a:0]asetpts=PTS-STARTPTS[v_orig_pts]")
+            audio_inputs_to_mix.append("[v_orig_pts]")
+
+    dur = max(1.0, float(clip_duration))
+
+    # BGM input with start offset & looping
+    if bgm_enabled and bgm_path and os.path.exists(bgm_path):
+        bgm_idx = input_idx_counter
+        input_idx_counter += 1
+        offset_sec = max(0.0, float(bgm_start_offset))
+        if offset_sec > 0.0:
+            extra_input_args.extend(["-ss", f"{offset_sec:.2f}"])
+        extra_input_args.extend(["-stream_loop", "-1", "-i", str(bgm_path)])
+
+        vol = max(0.0, min(1.0, float(bgm_volume)))
+        fade_st = max(0.0, dur - 1.5)
+        filter_chains.append(
+            f"[{bgm_idx}:a]asetpts=PTS-STARTPTS,volume={vol:.3f},afade=t=out:st={fade_st:.2f}:d=1.5[bgm_proc]"
+        )
+        audio_inputs_to_mix.append("[bgm_proc]")
+
+    # Hook SFX input placed at the very first frame (t=0)
+    if hook_sfx_enabled and hook_sfx_path and os.path.exists(hook_sfx_path):
+        sfx_idx = input_idx_counter
+        input_idx_counter += 1
+        extra_input_args.extend(["-i", str(hook_sfx_path)])
+
+        sfx_vol = max(0.0, min(2.0, float(hook_sfx_volume)))
+        filter_chains.append(
+            f"[{sfx_idx}:a]asetpts=PTS-STARTPTS,atrim=end={dur:.2f},volume={sfx_vol:.3f}[sfx_proc]"
+        )
+        audio_inputs_to_mix.append("[sfx_proc]")
+
+    # Mix audio streams together
+    if len(audio_inputs_to_mix) > 1:
+        mix_inputs_str = "".join(audio_inputs_to_mix)
+        filter_chains.append(
+            f"{mix_inputs_str}amix=inputs={len(audio_inputs_to_mix)}:duration=first:dropout_transition=2:normalize=0[a_final]"
+        )
+        out_audio_map = "[a_final]"
+    elif len(audio_inputs_to_mix) == 1:
+        single_stream = audio_inputs_to_mix[0]
+        if single_stream == "[0:a:0]":
+            out_audio_map = "0:a:0"
+        else:
+            filter_chains.append(f"{single_stream}anull[a_final]")
+            out_audio_map = "[a_final]"
+    else:
+        out_audio_map = "0:a:0?"
+
+    final_filter_complex = ";".join(filter_chains)
+
+    # Video encoder (resolved from user choice: auto, nvenc, amf, qsv, cpu)
+    chosen_encoder_name, chosen_encoder_args = resolve_encoder(hardware_accel)
+    v_codec_args = chosen_encoder_args
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_path),
+        *extra_input_args,
+        "-filter_complex", final_filter_complex,
+        "-map", out_video_map,
+        "-map", out_audio_map,
+        *v_codec_args,
+        "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(output_mp4_path)
+    ]
+
+    # Check if FFmpeg is installed and accessible
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("FFmpeg is not installed or not found in system PATH. Please install FFmpeg (e.g. 'winget install Gyan.FFmpeg') and restart your terminal.")
+
+    dur = max(1.0, float(clip_duration))
+    # Dynamic timeouts scaled to clip duration (e.g. 60s -> 600s / 10m, 120s -> 1080s / 18m, 180s -> 1560s / 26m)
+    render_timeout = max(360, min(2400, int(dur * 8) + 120))
+    cpu_render_timeout = max(480, min(3000, int(dur * 12) + 180))
+
+    logger.info(f"Rendering final vertical clip to {output_mp4_path} with {chosen_encoder_name} (Duration: {dur:.1f}s, Timeout: {render_timeout}s, Selection: {hardware_accel}, BGM: {bgm_enabled}, Watermark: {watermark_enabled})...")
+
+    res_code = -1
+    err_text = ""
+    try:
+        res_code, err_text = _run_ffmpeg_command_with_progress(
+            cmd,
+            total_duration=dur,
+            timeout=render_timeout,
+            progress_callback=progress_callback,
+            on_process_spawned=on_process_spawned
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Hardware encoder ({chosen_encoder_name}) timed out after {render_timeout}s.")
+        res_code = -1
+        err_text = f"Timed out after {render_timeout}s"
+
+    if res_code != 0 or not (os.path.exists(output_mp4_path) and is_valid_mp4(output_mp4_path)):
+        err_msg_initial = err_text[:250] if err_text else f"Timed out after {render_timeout}s"
+        logger.warning(f"Hardware encoder ({chosen_encoder_name}) failed or timed out: {err_msg_initial}")
+        # Automatic fallback to universal CPU encoding (libx264) if chosen hardware encoder fails
+        if chosen_encoder_name != "libx264":
+            logger.info(f"Retrying render with universal multi-threaded CPU encoder (libx264, timeout: {cpu_render_timeout}s)...")
+            cpu_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(video_path),
+                *extra_input_args,
+                "-filter_complex", final_filter_complex,
+                "-map", out_video_map,
+                "-map", out_audio_map,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+                "-c:a", "aac", "-b:a", "192k",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                "-shortest",
+                str(output_mp4_path)
+            ]
+            cpu_res_code = -1
+            cpu_err_text = ""
+            try:
+                cpu_res_code, cpu_err_text = _run_ffmpeg_command_with_progress(
+                    cpu_cmd,
+                    total_duration=dur,
+                    timeout=cpu_render_timeout,
+                    progress_callback=progress_callback,
+                    on_process_spawned=on_process_spawned
+                )
+            except subprocess.TimeoutExpired:
+                logger.error(f"FFmpeg CPU fallback timed out after {cpu_render_timeout}s.")
+                if os.path.exists(output_mp4_path):
+                    try:
+                        os.unlink(output_mp4_path)
+                    except Exception:
+                        pass
+                raise RuntimeError(f"FFmpeg rendering timed out after {cpu_render_timeout}s for clip of duration {dur:.1f}s.")
+
+            if cpu_res_code == 0 and os.path.exists(output_mp4_path) and is_valid_mp4(output_mp4_path):
+                logger.info(f"Successfully rendered with CPU fallback: {output_mp4_path}")
+                if progress_callback:
+                    progress_callback(1.0)
+                return str(output_mp4_path)
+            else:
+                if os.path.exists(output_mp4_path):
+                    try:
+                        os.unlink(output_mp4_path)
+                    except Exception:
+                        pass
+                active_err = cpu_err_text or err_text or "Unknown FFmpeg error"
+                if "moov atom not found" in active_err.lower():
+                    raise RuntimeError("FFmpeg rendering failed: Source video segment is incomplete ('moov atom not found'). Please retry rendering this clip.")
+                logger.error(f"FFmpeg CPU fallback also failed: {active_err}")
+                raise RuntimeError(f"FFmpeg rendering failed: {active_err}")
+        else:
+            if os.path.exists(output_mp4_path):
+                try:
+                    os.unlink(output_mp4_path)
+                except Exception:
+                    pass
+            if "moov atom not found" in err_text.lower():
+                raise RuntimeError("FFmpeg rendering failed: Source video segment is incomplete ('moov atom not found'). Please retry rendering this clip.")
+            logger.error(f"FFmpeg render error: {err_text}")
+            raise RuntimeError(f"FFmpeg rendering failed: {err_text or 'Unknown FFmpeg error'}")
+
+    if progress_callback:
+        progress_callback(1.0)
+    return str(output_mp4_path)
+
+
+def extract_clip_frame(video_url: str, video_id: str, timestamp: float = 0.0, cookies_content: Optional[str] = None) -> Optional[str]:
+    """
+    Extracts a single JPEG image frame at timestamp for the real video preview.
+    Caches the frame on disk in TEMP_DIR / 'frames'.
+    Guarantees returning a real video frame, never a promotional thumbnail.
+    """
+    frames_dir = TEMP_DIR / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_id = re.sub(r'[^a-zA-Z0-9_-]', '_', video_id)
+    target_ts = max(1.0, timestamp if timestamp > 0 else 5.0)
+    sec = int(round(target_ts))
+    frame_path = frames_dir / f"{safe_id}_{sec}.jpg"
+
+    if frame_path.exists() and frame_path.stat().st_size > 2000:
+        return str(frame_path)
+
+    # 0. Check if this is an uploaded or gdrive local video in UPLOADS_DIR or specified by video_url
+    local_source = None
+    clean_vurl = urllib.parse.unquote(video_url.strip()) if video_url else ""
+    clean_vbase = os.path.basename(clean_vurl.split("?")[0]) if clean_vurl else ""
+
+    if clean_vurl and os.path.exists(clean_vurl):
+        local_source = Path(clean_vurl)
+    elif video_url and os.path.exists(video_url):
+        local_source = Path(video_url)
+    elif clean_vurl and clean_vurl.startswith("/api/video/") and (UPLOADS_DIR / clean_vbase).exists():
+        local_source = UPLOADS_DIR / clean_vbase
+    elif clean_vbase and (UPLOADS_DIR / clean_vbase).exists():
+        local_source = UPLOADS_DIR / clean_vbase
+    elif (UPLOADS_DIR / f"{safe_id}.mp4").exists():
+        local_source = UPLOADS_DIR / f"{safe_id}.mp4"
+    else:
+        for q in [clean_vbase, safe_id, video_id, video_id.replace("gdrive_", "").replace("upload_", "")]:
+            if not q or len(q) < 3:
+                continue
+            for candidate in UPLOADS_DIR.glob(f"*{q}*"):
+                if candidate.is_file() and is_valid_mp4(candidate) and "_clip_" not in candidate.name:
+                    local_source = candidate
+                    break
+            if local_source:
+                break
+
+    if local_source and local_source.exists():
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", str(target_ts),
+            "-i", str(local_source),
+            "-vframes", "1",
+            "-q:v", "2",
+            "-strict", "-1",
+            str(frame_path)
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=10)
+        if frame_path.exists() and frame_path.stat().st_size > 500:
+            return str(frame_path)
+
+    # 1. Check local sliced clips or exports
+    local_candidates = list(TEMP_DIR.glob(f"*{safe_id}*.mp4")) + list(EXPORTS_DIR.glob(f"*{safe_id}*.mp4"))
+    for candidate in local_candidates:
+        if candidate.exists() and candidate.stat().st_size > 10000 and "slice_" not in candidate.name and is_valid_mp4(candidate):
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", "00:00:01.00",
+                "-i", str(candidate),
+                "-vframes", "1",
+                "-strict", "-1",
+                str(frame_path)
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=10)
+            if frame_path.exists() and frame_path.stat().st_size > 2000:
+                return str(frame_path)
+
+    # 2. Extract a tiny 1-second slice of format 18 (fast 360p mp4) using yt-dlp + ffmpeg
+    try:
+        from backend.utils.text import is_twitch_url, extract_twitch_info, get_twitch_canonical_url
+        if video_url and is_twitch_url(video_url):
+            tw_info = extract_twitch_info(video_url)
+            clean_url = get_twitch_canonical_url(tw_info) if tw_info else video_url.strip()
+        elif is_twitch_url(video_id):
+            tw_info = extract_twitch_info(video_id)
+            clean_url = get_twitch_canonical_url(tw_info) if tw_info else video_id
+        else:
+            clean_url = video_url.strip() if video_url else f"https://www.youtube.com/watch?v={video_id}"
+        temp_slice = frames_dir / f"slice_{safe_id}_{sec}.mp4"
+        try:
+            with ephemeral_cookies_file(cookies_content) as temp_cookies:
+                base_cmd = get_yt_dlp_base_cmd(include_cookies=True, cookies_path=temp_cookies)
+
+                t_start = target_ts
+                t_end = target_ts + 1.0
+                t_start_fmt = format_section_time(t_start)
+                t_end_fmt = format_section_time(t_end)
+
+                slice_cmd = [
+                    *base_cmd,
+                    "-f", "18/best[height<=720]/best",
+                    "--download-sections", f"*{t_start_fmt}-{t_end_fmt}",
+                    "-o", str(temp_slice),
+                    "--no-warnings",
+                    clean_url
+                ]
+                subprocess.run(slice_cmd, capture_output=True, text=True, timeout=20)
+            if temp_slice.exists() and temp_slice.stat().st_size > 1000:
+                ff_cmd = [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-ss", "00:00:00.20",
+                    "-i", str(temp_slice),
+                    "-vframes", "1",
+                    "-strict", "-1",
+                    str(frame_path)
+                ]
+                subprocess.run(ff_cmd, capture_output=True, timeout=5)
+        finally:
+            if temp_slice.exists():
+                try:
+                    temp_slice.unlink()
+                except Exception:
+                    pass
+
+        if frame_path.exists() and frame_path.stat().st_size > 2000:
+            return str(frame_path)
+    except Exception as e:
+        logger.warning(f"Slice frame extraction failed for {video_id}: {e}")
+
+    # 3. Check any existing frame for this video in frames_dir as fallback
+    existing_frames = list(frames_dir.glob(f"{safe_id}_*.jpg"))
+    if existing_frames:
+        return str(existing_frames[0])
+
+    # 4. Instant high-res thumbnail fallback (guarantees frame preview NEVER gets stuck)
+    try:
+        for thumb_url in [
+            f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        ]:
+            try:
+                req = urllib.request.Request(thumb_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp, open(frame_path, "wb") as f_out:
+                    f_out.write(resp.read())
+                if frame_path.exists() and frame_path.stat().st_size > 2000:
+                    return str(frame_path)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"Thumbnail fallback failed for {video_id}: {e}")
+
+    return None

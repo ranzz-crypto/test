@@ -1,0 +1,1019 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import subprocess
+import zipfile
+from typing import Any, Dict, List, Optional
+
+from backend.config import (
+    EXPORTS_DIR,
+    TEMP_DIR,
+    download_clip_segment,
+    generate_ass_file,
+    has_emoji,
+    is_valid_mp4,
+    logger,
+    render_clip_to_mp4,
+    render_title_overlay_png,
+    transcribe_clip_words,
+)
+from backend.schemas.render import RenderBatchRequest, RenderSettingsModel
+from backend.utils.text import is_twitch_url, extract_twitch_info, get_twitch_canonical_url, canonical_video_url
+
+RENDER_BATCHES: Dict[str, Dict[str, Any]] = {}
+BATCH_REQUESTS: Dict[str, RenderBatchRequest] = {}
+# Concurrency gate: serialize video rendering (1 active render job at a time) to prevent CPU starvation on low-spec servers
+_RENDER_SEMAPHORE = asyncio.Semaphore(1)
+
+ACTIVE_BATCH_PROCESSES: Dict[str, subprocess.Popen] = {}
+ACTIVE_BATCH_TASKS: Dict[str, asyncio.Task] = {}
+CANCELLED_BATCH_IDS: set = set()
+
+
+def kill_process_tree(pid: int):
+    """Cleanly terminates a process and all its child subprocesses (FFmpeg, yt-dlp)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+        else:
+            try:
+                import signal
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"Error terminating process {pid}: {e}")
+
+
+def register_batch_process(batch_id: str, proc: subprocess.Popen):
+    ACTIVE_BATCH_PROCESSES[batch_id] = proc
+
+
+def unregister_batch_process(batch_id: str, proc: Optional[subprocess.Popen] = None):
+    if batch_id in ACTIVE_BATCH_PROCESSES:
+        if proc is None or ACTIVE_BATCH_PROCESSES[batch_id] == proc:
+            ACTIVE_BATCH_PROCESSES.pop(batch_id, None)
+
+
+def is_batch_cancelled(batch_id: str) -> bool:
+    return batch_id in CANCELLED_BATCH_IDS
+
+
+def cancel_batch_rendering(batch_id: str) -> bool:
+    """Terminates active render subprocesses and flags the batch as cancelled."""
+    CANCELLED_BATCH_IDS.add(batch_id)
+    logger.info(f"Cancellation initiated for batch {batch_id}")
+
+    # 1. Kill active subprocess if any
+    proc = ACTIVE_BATCH_PROCESSES.get(batch_id)
+    if proc:
+        logger.info(f"Terminating active render process {proc.pid} for batch {batch_id}")
+        kill_process_tree(proc.pid)
+        ACTIVE_BATCH_PROCESSES.pop(batch_id, None)
+
+    # 2. Cancel asyncio task if running
+    task = ACTIVE_BATCH_TASKS.get(batch_id)
+    if task and not task.done():
+        logger.info(f"Cancelling active asyncio task for batch {batch_id}")
+        task.cancel()
+
+    # 3. Update in-memory batch state immediately so UI updates right away
+    batch = RENDER_BATCHES.get(batch_id)
+    if batch:
+        batch["overall_status"] = "cancelled"
+        batch["error_message"] = "Render process was cancelled by the user."
+        for clip in batch.get("clips", []):
+            if clip.get("status") in ["pending", "downloading", "transcribing", "rendering"]:
+                clip["status"] = "cancelled"
+                clip["error_message"] = "Cancelled by user"
+        save_render_batches()
+
+    return True
+
+BATCH_STATE_FILE = TEMP_DIR / "render_batches_state.json"
+
+
+def save_render_batches():
+    """Safely saves active/completed batches to disk to survive server reloads."""
+    try:
+        data = {}
+        for b_id, b_data in list(RENDER_BATCHES.items()):
+            data[b_id] = {
+                "batch_id": b_data.get("batch_id"),
+                "total_clips": b_data.get("total_clips"),
+                "current_clip_index": b_data.get("current_clip_index"),
+                "overall_status": b_data.get("overall_status"),
+                "clips": b_data.get("clips", []),
+                "zip_url": b_data.get("zip_url"),
+                "is_merged": b_data.get("is_merged", False),
+                "merged_segments_count": b_data.get("merged_segments_count")
+            }
+        with open(BATCH_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception as e:
+        logger.debug(f"Failed to persist batch states: {e}")
+
+
+def load_render_batches():
+    """Loads previously saved batches on server startup."""
+    if not BATCH_STATE_FILE.exists():
+        return
+    try:
+        if BATCH_STATE_FILE.stat().st_size == 0:
+            return
+        with open(BATCH_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                for b_id, b_data in data.items():
+                    if b_id not in RENDER_BATCHES:
+                        if b_data.get("overall_status") == "running":
+                            b_data["overall_status"] = "interrupted"
+                        RENDER_BATCHES[b_id] = b_data
+    except Exception as e:
+        logger.debug(f"Failed to load batch states: {e}")
+
+
+load_render_batches()
+
+
+async def render_single_batch_clip(
+    batch_id: str,
+    idx: int,
+    clip: Dict[str, Any],
+    settings: RenderSettingsModel,
+    target_url: str,
+    transcript: Optional[List[Dict[str, Any]]] = None,
+    total_clips: int = 1,
+    cookies_content: Optional[str] = None
+):
+    batch = RENDER_BATCHES.get(batch_id)
+    if not batch:
+        return
+
+    clip_status = batch["clips"][idx]
+    if is_batch_cancelled(batch_id):
+        clip_status["status"] = "cancelled"
+        clip_status["error_message"] = "Cancelled by user"
+        return
+
+    clip_status["status"] = "downloading"
+    clip_status["progress_percent"] = 15
+    clip_status["current_step"] = 1
+    clip_status["total_steps"] = 4
+    clip_status["step_name"] = "Ambil Bahan"
+    clip_status["step_progress"] = 20
+    clip_status["step_detail"] = "Mengambil video bahan sumber..."
+    clip_status["error_message"] = None
+    clip_status["error"] = None
+
+    raw_path = None
+    ass_path = None
+    title_overlay_path = None
+    out_path = None
+
+    try:
+        # 1. Download
+        start_t = float(clip.get("start_time", 0.0))
+        end_t = float(clip.get("end_time", start_t + 30.0))
+        seg_filename = f"{batch_id}_clip_{idx}_raw.mp4"
+
+        raw_path = await asyncio.to_thread(
+            download_clip_segment,
+            target_url,
+            start_t,
+            end_t,
+            seg_filename,
+            cookies_content,
+            lambda p: register_batch_process(batch_id, p)
+        )
+        unregister_batch_process(batch_id)
+
+        if is_batch_cancelled(batch_id):
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            if raw_path and os.path.exists(raw_path):
+                try:
+                    os.unlink(raw_path)
+                except Exception:
+                    pass
+            return
+
+        if not raw_path or not os.path.exists(raw_path) or not is_valid_mp4(raw_path):
+            raise RuntimeError(
+                "Source video segment is incomplete or corrupted ('moov atom not found'). "
+                "Network lag interrupted the download. Please retry rendering this clip."
+            )
+
+        # 2. Transcribe & Generate Subtitles / Title (.ass)
+        clip_status["status"] = "transcribing"
+        clip_status["progress_percent"] = 40
+        clip_status["current_step"] = 2
+        clip_status["total_steps"] = 4
+        clip_status["step_name"] = "Aset & Subtitle"
+        clip_status["step_progress"] = 50
+        clip_status["step_detail"] = "Sinkronisasi dialog subtitle & memuat tipografi font..."
+
+        display_title = None
+        base_title = (
+            clip.get("custom_title")
+            or clip.get("title_suggestion")
+            or clip.get("title")
+            or f"Clip {idx+1}"
+        ).strip()
+
+        if settings.title_position != "none":
+            pfx = settings.title_prefix or ""
+            sfx = settings.title_suffix or ""
+            if pfx or sfx:
+                display_title = f"{pfx}{base_title}{sfx}".strip()
+            elif total_clips == 1 and settings.title_text and settings.title_text.strip() and not (clip.get("custom_title") or clip.get("title_suggestion")):
+                display_title = settings.title_text.strip()
+            else:
+                display_title = base_title
+
+        clip_status["title"] = display_title or base_title
+        clip_status["base_title"] = base_title
+
+        skip_ass_title = False
+        duration_sec = max(1.0, end_t - start_t)
+
+        # Check if title has emoji -> render transparent color emoji PNG overlay
+        if display_title and settings.title_position != "none" and has_emoji(display_title):
+            title_png_filename = f"{batch_id}_clip_{idx}_title.png"
+            title_png_path = str(TEMP_DIR / title_png_filename)
+            try:
+                canvas_w = 1920 if (settings.aspect_ratio == "16:9_landscape") else 1080
+                canvas_h = 1080 if (settings.aspect_ratio == "16:9_landscape") else 1920
+                rendered_overlay = await asyncio.to_thread(
+                    render_title_overlay_png,
+                    title_text=display_title,
+                    output_png_path=title_png_path,
+                    font_name=settings.title_font or settings.caption_font or "Outfit",
+                    target_aspect_ratio=settings.aspect_ratio or "9:16",
+                    font_size_preset=settings.title_font_size or settings.font_size or "medium",
+                    text_case=settings.title_text_case or settings.text_case or "uppercase",
+                    title_position=settings.title_position or "auto",
+                    title_y_percent=settings.title_y_percent,
+                    canvas_w=canvas_w,
+                    canvas_h=canvas_h,
+                    title_font_size_preset=settings.title_font_size or settings.font_size or "medium",
+                    streamer_preset=settings.streamer_preset or "none",
+                    title_font_name=settings.title_font or settings.caption_font or "Outfit",
+                    title_font_size_px=settings.title_font_size_px,
+                    title_text_case=settings.title_text_case or settings.text_case or "uppercase",
+                    title_x_percent=getattr(settings, "title_x_percent", 50.0)
+                )
+                if rendered_overlay and os.path.exists(rendered_overlay):
+                    title_overlay_path = rendered_overlay
+                    skip_ass_title = True
+                    logger.info(f"Rendered full-color emoji title overlay: {title_overlay_path}")
+            except Exception as ex:
+                logger.warning(f"Could not render color emoji title overlay: {ex}")
+                skip_ass_title = False
+
+        # Detect language from transcript or video context
+        target_lang = None
+        if transcript:
+            try:
+                from backend.utils.text import detect_transcript_language
+                detected = detect_transcript_language(transcript[:50], display_title or "")
+                if detected and detected.get("code") in ("id", "en"):
+                    target_lang = detected["code"]
+            except Exception:
+                pass
+
+        # Check if subtitles are actively enabled (must be enabled AND not set to style 'none')
+        subtitles_active = bool(getattr(settings, "subtitles_enabled", True)) and (settings.caption_style != "none")
+
+        if subtitles_active or (display_title and settings.title_position != "none" and not skip_ass_title):
+            words = []
+            if subtitles_active:
+                words = await asyncio.to_thread(
+                    transcribe_clip_words,
+                    raw_path,
+                    transcript,
+                    start_t,
+                    end_t,
+                    target_lang
+                )
+            ass_filename = f"{batch_id}_clip_{idx}.ass"
+            ass_path = str(TEMP_DIR / ass_filename)
+            await asyncio.to_thread(
+                generate_ass_file,
+                words=words if subtitles_active else [],
+                style_preset=settings.caption_style if subtitles_active else "none",
+                font_name=settings.caption_font or "Outfit",
+                output_ass_path=ass_path,
+                target_aspect_ratio=settings.aspect_ratio,
+                font_size_preset=settings.font_size,
+                text_case=settings.text_case,
+                title_text=display_title if not skip_ass_title else None,
+                title_position=settings.title_position,
+                title_duration=settings.title_duration if settings.title_duration else "entire",
+                duration_seconds=duration_sec,
+                title_y_percent=settings.title_y_percent,
+                subtitle_y_percent=settings.subtitle_y_percent,
+                subtitle_position_mode=settings.subtitle_position_mode if settings.subtitle_position_mode else "bottom",
+                subtitle_center_y_percent=settings.subtitle_center_y_percent if settings.subtitle_center_y_percent is not None else 50.0,
+                skip_title=skip_ass_title,
+                title_font_size_preset=settings.title_font_size or settings.font_size or "medium",
+                streamer_preset=settings.streamer_preset or "none",
+                title_font_name=settings.title_font or settings.caption_font or "Outfit",
+                font_size_px=settings.font_size_px,
+                title_font_size_px=settings.title_font_size_px,
+                title_text_case=settings.title_text_case or settings.text_case or "uppercase",
+                title_x_percent=getattr(settings, "title_x_percent", 50.0),
+                subtitle_offset_seconds=getattr(settings, "subtitle_offset_seconds", 0.0)
+            )
+
+        # 3. Render Final Vertical MP4
+        if is_batch_cancelled(batch_id):
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            if raw_path and os.path.exists(raw_path):
+                try:
+                    os.unlink(raw_path)
+                except Exception:
+                    pass
+            return
+
+        clip_status["status"] = "rendering"
+        clip_status["progress_percent"] = 50
+        clip_status["current_step"] = 3
+        clip_status["total_steps"] = 4
+        clip_status["step_name"] = "Render FFmpeg"
+        clip_status["step_progress"] = 10
+        clip_status["step_detail"] = "Memproses filtergraph 9:16 & encoding hardware..."
+
+        out_filename = f"clip_{idx+1}_{batch_id}.mp4"
+        out_path = str(EXPORTS_DIR / out_filename)
+
+        def _on_single_clip_progress(frac: float):
+            clip_status["progress_percent"] = min(98, int(50.0 + frac * 48.0))
+            clip_status["step_progress"] = min(100, int(frac * 100))
+            clip_status["step_detail"] = f"Encoding video frame ({int(frac * 100)}%)..."
+
+        await asyncio.to_thread(
+            render_clip_to_mp4,
+            video_path=raw_path,
+            output_mp4_path=out_path,
+            aspect_ratio=settings.aspect_ratio,
+            background_style=settings.background_style,
+            enable_face_tracking=settings.enable_face_tracking,
+            streamer_preset=settings.streamer_preset,
+            facecam_position=getattr(settings, "facecam_position", "auto") or "auto",
+            title_text=display_title if not skip_ass_title else None,
+            title_position=settings.title_position,
+            ass_subtitles_path=ass_path,
+            clip_duration=duration_sec,
+            title_overlay_path=title_overlay_path,
+            title_duration=settings.title_duration if settings.title_duration else "entire",
+            watermark_enabled=bool(settings.watermark_enabled),
+            watermark_type=settings.watermark_type or "image",
+            watermark_image_path=settings.watermark_file_path,
+            watermark_text=settings.watermark_text,
+            watermark_size=float(settings.watermark_size if settings.watermark_size is not None else 20.0),
+            watermark_opacity=float((settings.watermark_opacity if settings.watermark_opacity is not None else 80.0) / 100.0),
+            watermark_x_percent=float(settings.watermark_x if settings.watermark_x is not None else 90.0),
+            watermark_y_percent=float(settings.watermark_y if settings.watermark_y is not None else 8.0),
+            bgm_enabled=bool(settings.bgm_enabled),
+            bgm_path=settings.bgm_file_path,
+            bgm_volume=float((settings.bgm_volume if settings.bgm_volume is not None else 25.0) / 100.0),
+            bgm_start_offset=float(settings.bgm_start_offset or 0.0),
+            hook_sfx_enabled=bool(settings.hook_sfx_enabled),
+            hook_sfx_path=settings.hook_sfx_file_path,
+            hook_sfx_volume=float((settings.hook_sfx_volume if settings.hook_sfx_volume is not None else 100.0) / 100.0),
+            original_audio_volume=float((settings.original_audio_volume if settings.original_audio_volume is not None else 100.0) / 100.0),
+            hardware_accel=settings.hardware_accel or "auto",
+            title_y_percent=settings.title_y_percent,
+            crop_x_percent=getattr(settings, "crop_x_percent", None),
+            title_x_percent=getattr(settings, "title_x_percent", 50.0),
+            progress_callback=_on_single_clip_progress,
+            on_process_spawned=lambda p: register_batch_process(batch_id, p)
+        )
+        unregister_batch_process(batch_id)
+
+        if is_batch_cancelled(batch_id):
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except Exception:
+                    pass
+            return
+
+        if not os.path.exists(out_path) or not is_valid_mp4(out_path):
+            raise RuntimeError("Rendered MP4 file is incomplete or missing. Please retry rendering.")
+
+        clip_status["status"] = "completed"
+        clip_status["progress_percent"] = 100
+        clip_status["current_step"] = 4
+        clip_status["total_steps"] = 4
+        clip_status["step_name"] = "Selesai"
+        clip_status["step_progress"] = 100
+        clip_status["step_detail"] = "Klip berhasil dirender & disimpan!"
+        clip_status["download_url"] = f"/api/download-rendered/{out_filename}"
+        clip_status["output_path"] = out_path
+
+    except Exception as e:
+        if is_batch_cancelled(batch_id):
+            logger.info(f"Render clip {idx} in batch {batch_id} cancelled.")
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            clip_status["error"] = "Cancelled by user"
+            if raw_path and os.path.exists(raw_path):
+                try:
+                    os.unlink(raw_path)
+                except Exception:
+                    pass
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except Exception:
+                    pass
+            return
+
+        logger.error(f"Error rendering clip {idx} in batch {batch_id}: {e}")
+        clip_status["status"] = "error"
+        err_msg = str(e)
+        if "moov atom not found" in err_msg.lower():
+            err_msg = "Download interrupted by internet lag ('moov atom not found'). Click Retry to re-download."
+        elif "timed out" in err_msg.lower() or "timeout" in err_msg.lower():
+            if clip_status.get("status") == "rendering":
+                err_msg = "Video rendering timed out. Try switching to 'Universal CPU (libx264)' in Studio Settings or retry."
+            else:
+                err_msg = "Video download timed out due to slow/laggy internet connection. Click Retry to try again."
+        clip_status["error_message"] = err_msg
+        clip_status["error"] = err_msg
+
+        # Clean up any partial raw video
+        if raw_path and os.path.exists(raw_path):
+            try:
+                os.unlink(raw_path)
+            except Exception:
+                pass
+
+
+def update_batch_summary_and_zip(batch_id: str, settings: RenderSettingsModel):
+    """
+    Updates the batch ZIP archive and computes overall status and friendly messages.
+    """
+    batch = RENDER_BATCHES.get(batch_id)
+    if not batch:
+        return
+
+    if is_batch_cancelled(batch_id) or batch.get("overall_status") == "cancelled":
+        batch["overall_status"] = "cancelled"
+        save_render_batches()
+        return
+
+    # Generate/update ZIP bundle for the batch with title-based filenames and duplicate handling
+    try:
+        completed_clips = [c for c in batch["clips"] if c.get("status") == "completed" and c.get("download_url")]
+        if completed_clips:
+            zip_filename = f"cheat_clip_pro_{batch_id}.zip"
+            zip_path = EXPORTS_DIR / zip_filename
+            title_counts: Dict[str, int] = {}
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for c in completed_clips:
+                    fname = c["download_url"].split("?")[0].split("/")[-1]
+                    fpath = EXPORTS_DIR / fname
+                    if fpath.exists():
+                        raw_title = (c.get("base_title") or c.get("title") or "").strip()
+                        clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title) or f"clip_{c.get('clip_index', 1)}"
+                        fn_pfx = re.sub(r'[\\/*?:"<>|]', "", settings.file_name_prefix or "")
+                        fn_sfx = re.sub(r'[\\/*?:"<>|]', "", settings.file_name_suffix or "")
+                        formatted_name = f"{fn_pfx}{clean_title}{fn_sfx}".strip() or clean_title
+                        count = title_counts.get(formatted_name, 0)
+                        title_counts[formatted_name] = count + 1
+                        arc_name = f"{formatted_name}.mp4" if count == 0 else f"{formatted_name} ({count}).mp4"
+                        zipf.write(fpath, arcname=arc_name)
+            batch["zip_url"] = f"/api/download-batch-zip/{batch_id}"
+        else:
+            batch["zip_url"] = None
+    except Exception as e:
+        logger.warning(f"Failed to create batch zip: {e}")
+
+    # Determine overall status and error messaging
+    failed_clips = [c for c in batch["clips"] if c.get("status") == "error"]
+    running_clips = [c for c in batch["clips"] if c.get("status") in ["downloading", "transcribing", "rendering", "pending"]]
+
+    if running_clips:
+        batch["overall_status"] = "running"
+    elif len(failed_clips) == len(batch["clips"]):
+        batch["overall_status"] = "error"
+        batch["error_message"] = f"All {len(batch['clips'])} clip(s) failed. You can click 'Retry' to try again."
+    elif len(failed_clips) > 0:
+        batch["overall_status"] = "completed"
+        batch["warning_message"] = f"{len(failed_clips)} of {len(batch['clips'])} clips encountered errors. You can retry failed clips anytime."
+    else:
+        batch["overall_status"] = "completed"
+        batch["warning_message"] = None
+
+    save_render_batches()
+
+
+async def render_merged_batch_clips(
+    batch_id: str,
+    clips: List[Dict[str, Any]],
+    settings: RenderSettingsModel,
+    target_url: str,
+    transcript: Optional[List[Dict[str, Any]]] = None,
+    cookies_content: Optional[str] = None
+):
+    batch = RENDER_BATCHES.get(batch_id)
+    if not batch:
+        return
+
+    clip_status = batch["clips"][0]
+    if is_batch_cancelled(batch_id):
+        clip_status["status"] = "cancelled"
+        clip_status["error_message"] = "Cancelled by user"
+        return
+
+    clip_status["status"] = "downloading"
+    clip_status["progress_percent"] = 10
+    clip_status["error_message"] = None
+    clip_status["error"] = None
+
+    part_paths: List[str] = []
+    raw_merged_path: Optional[str] = None
+    ass_path: Optional[str] = None
+    title_overlay_path: Optional[str] = None
+    out_path: Optional[str] = None
+
+    try:
+        total_segments = len(clips)
+        # 1. Download / slice each segment
+        for i, seg in enumerate(clips):
+            if is_batch_cancelled(batch_id):
+                clip_status["status"] = "cancelled"
+                clip_status["error_message"] = "Cancelled by user"
+                return
+
+            clip_status["progress_percent"] = 10 + int((i / max(1, total_segments)) * 25)
+            s_t = float(seg.get("start_time", 0.0))
+            e_t = float(seg.get("end_time", s_t + 30.0))
+            part_filename = f"{batch_id}_part_{i}_raw.mp4"
+            p_path = await asyncio.to_thread(
+                download_clip_segment,
+                target_url,
+                s_t,
+                e_t,
+                part_filename,
+                cookies_content,
+                lambda p: register_batch_process(batch_id, p)
+            )
+            unregister_batch_process(batch_id)
+
+            if is_batch_cancelled(batch_id):
+                clip_status["status"] = "cancelled"
+                clip_status["error_message"] = "Cancelled by user"
+                return
+
+            if not p_path or not os.path.exists(p_path) or not is_valid_mp4(p_path):
+                raise RuntimeError(
+                    f"Segment #{i+1} ({s_t:.1f}s - {e_t:.1f}s) is incomplete or corrupted. Please retry rendering."
+                )
+            part_paths.append(p_path)
+
+        # 2. Concatenate raw video segments
+        if is_batch_cancelled(batch_id):
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            return
+
+        clip_status["status"] = "transcribing"
+        clip_status["progress_percent"] = 40
+
+        raw_merged_filename = f"{batch_id}_merged_raw.mp4"
+        raw_merged_path = str(TEMP_DIR / raw_merged_filename)
+
+        if len(part_paths) == 1:
+            raw_merged_path = part_paths[0]
+        else:
+            inputs = []
+            filter_parts = []
+            for idx_p, p in enumerate(part_paths):
+                inputs.extend(["-i", p])
+                filter_parts.append(f"[{idx_p}:v][{idx_p}:a]")
+            filter_str = f"{''.join(filter_parts)}concat=n={len(part_paths)}:v=1:a=1[v][a]"
+            concat_cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                *inputs,
+                "-filter_complex", filter_str,
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                raw_merged_path
+            ]
+            concat_timeout = max(180, total_segments * 60)
+            logger.info(f"Concatenating {len(part_paths)} segments into {raw_merged_path}")
+            concat_p = subprocess.Popen(concat_cmd)
+            register_batch_process(batch_id, concat_p)
+            try:
+                await asyncio.to_thread(concat_p.communicate, timeout=concat_timeout)
+            finally:
+                unregister_batch_process(batch_id)
+
+            if is_batch_cancelled(batch_id):
+                clip_status["status"] = "cancelled"
+                clip_status["error_message"] = "Cancelled by user"
+                return
+            if concat_p.returncode != 0:
+                raise RuntimeError("Failed to concatenate video segments")
+
+        # 3. Transcribe & generate time-shifted subtitles
+        target_lang = None
+        if transcript:
+            try:
+                from backend.utils.text import detect_transcript_language
+                detected = detect_transcript_language(transcript[:50])
+                if detected and detected.get("code") in ("id", "en"):
+                    target_lang = detected["code"]
+            except Exception:
+                pass
+
+        total_duration_sec = 0.0
+        merged_words = []
+        subtitles_active = bool(getattr(settings, "subtitles_enabled", True)) and (settings.caption_style != "none")
+        for i, seg in enumerate(clips):
+            s_t = float(seg.get("start_time", 0.0))
+            e_t = float(seg.get("end_time", s_t + 30.0))
+            seg_dur = max(0.1, e_t - s_t)
+            if subtitles_active:
+                seg_words = await asyncio.to_thread(
+                    transcribe_clip_words,
+                    part_paths[i],
+                    transcript,
+                    s_t,
+                    e_t,
+                    target_lang
+                )
+                for w in seg_words:
+                    w_copy = dict(w)
+                    w_start = float(w.get("start", 0.0))
+                    w_end = float(w.get("end", w_start + 0.15))
+                    w_copy["start"] = round(total_duration_sec + max(0.0, w_start), 3)
+                    w_copy["end"] = round(max(w_copy["start"] + 0.1, total_duration_sec + max(0.0, w_end)), 3)
+                    merged_words.append(w_copy)
+            total_duration_sec += seg_dur
+
+        total_duration_sec = max(1.0, total_duration_sec)
+
+        display_title = clip_status.get("title") or clip_status.get("base_title") or "Highlight Video"
+        skip_ass_title = False
+
+        if display_title and settings.title_position != "none" and has_emoji(display_title):
+            title_png_filename = f"{batch_id}_merged_title.png"
+            title_png_path = str(TEMP_DIR / title_png_filename)
+            try:
+                canvas_w = 1920 if (settings.aspect_ratio == "16:9_landscape") else 1080
+                canvas_h = 1080 if (settings.aspect_ratio == "16:9_landscape") else 1920
+                rendered_overlay = await asyncio.to_thread(
+                    render_title_overlay_png,
+                    title_text=display_title,
+                    output_png_path=title_png_path,
+                    font_name=settings.title_font or settings.caption_font or "Outfit",
+                    target_aspect_ratio=settings.aspect_ratio or "9:16",
+                    font_size_preset=settings.title_font_size or settings.font_size or "medium",
+                    text_case=settings.title_text_case or settings.text_case or "uppercase",
+                    title_position=settings.title_position or "auto",
+                    title_y_percent=settings.title_y_percent,
+                    canvas_w=canvas_w,
+                    canvas_h=canvas_h,
+                    title_font_size_preset=settings.title_font_size or settings.font_size or "medium",
+                    streamer_preset=settings.streamer_preset or "none",
+                    title_font_name=settings.title_font or settings.caption_font or "Outfit",
+                    title_font_size_px=settings.title_font_size_px,
+                    title_text_case=settings.title_text_case or settings.text_case or "uppercase",
+                    title_x_percent=getattr(settings, "title_x_percent", 50.0)
+                )
+                if rendered_overlay and os.path.exists(rendered_overlay):
+                    title_overlay_path = rendered_overlay
+                    skip_ass_title = True
+            except Exception as ex:
+                logger.warning(f"Could not render color emoji title overlay for merged clip: {ex}")
+                skip_ass_title = False
+
+        if settings.caption_style != "none" or (display_title and settings.title_position != "none" and not skip_ass_title):
+            ass_filename = f"{batch_id}_merged.ass"
+            ass_path = str(TEMP_DIR / ass_filename)
+            await asyncio.to_thread(
+                generate_ass_file,
+                words=merged_words,
+                style_preset=settings.caption_style,
+                font_name=settings.caption_font or "Outfit",
+                output_ass_path=ass_path,
+                target_aspect_ratio=settings.aspect_ratio,
+                font_size_preset=settings.font_size,
+                text_case=settings.text_case,
+                title_text=display_title if not skip_ass_title else None,
+                title_position=settings.title_position,
+                title_duration=settings.title_duration if settings.title_duration else "entire",
+                duration_seconds=total_duration_sec,
+                title_y_percent=settings.title_y_percent,
+                subtitle_y_percent=settings.subtitle_y_percent,
+                subtitle_position_mode=settings.subtitle_position_mode if settings.subtitle_position_mode else "bottom",
+                subtitle_center_y_percent=settings.subtitle_center_y_percent if settings.subtitle_center_y_percent is not None else 50.0,
+                skip_title=skip_ass_title,
+                title_font_size_preset=settings.title_font_size or settings.font_size or "medium",
+                streamer_preset=settings.streamer_preset or "none",
+                title_font_name=settings.title_font or settings.caption_font or "Outfit",
+                font_size_px=settings.font_size_px,
+                title_font_size_px=settings.title_font_size_px,
+                title_text_case=settings.title_text_case or settings.text_case or "uppercase"
+            )
+
+        # 4. Render Final Single MP4
+        if is_batch_cancelled(batch_id):
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            return
+
+        clip_status["status"] = "rendering"
+        clip_status["progress_percent"] = 55
+
+        clean_safe_title = re.sub(r'[\\/*?:"<>|]', "", clip_status.get("base_title") or "highlight_compilation")
+        clean_safe_title = clean_safe_title.replace(" ", "_")[:40] or "compilation"
+        out_filename = f"compilation_{clean_safe_title}_{batch_id}.mp4"
+        out_path = str(EXPORTS_DIR / out_filename)
+
+        def _on_compilation_progress(frac: float):
+            clip_status["progress_percent"] = min(98, int(55.0 + frac * 43.0))
+
+        await asyncio.to_thread(
+            render_clip_to_mp4,
+            video_path=raw_merged_path,
+            output_mp4_path=out_path,
+            aspect_ratio=settings.aspect_ratio,
+            background_style=settings.background_style,
+            enable_face_tracking=settings.enable_face_tracking,
+            streamer_preset=settings.streamer_preset,
+            facecam_position=getattr(settings, "facecam_position", "auto") or "auto",
+            title_text=display_title if not skip_ass_title else None,
+            title_position=settings.title_position,
+            ass_subtitles_path=ass_path,
+            clip_duration=total_duration_sec,
+            title_overlay_path=title_overlay_path,
+            title_duration=settings.title_duration if settings.title_duration else "entire",
+            watermark_enabled=bool(settings.watermark_enabled),
+            watermark_type=settings.watermark_type or "image",
+            watermark_image_path=settings.watermark_file_path,
+            watermark_text=settings.watermark_text,
+            watermark_size=float(settings.watermark_size if settings.watermark_size is not None else 20.0),
+            watermark_opacity=float((settings.watermark_opacity if settings.watermark_opacity is not None else 80.0) / 100.0),
+            watermark_x_percent=float(settings.watermark_x if settings.watermark_x is not None else 90.0),
+            watermark_y_percent=float(settings.watermark_y if settings.watermark_y is not None else 8.0),
+            bgm_enabled=bool(settings.bgm_enabled),
+            bgm_path=settings.bgm_file_path,
+            bgm_volume=float((settings.bgm_volume if settings.bgm_volume is not None else 25.0) / 100.0),
+            bgm_start_offset=float(settings.bgm_start_offset or 0.0),
+            hook_sfx_enabled=bool(settings.hook_sfx_enabled),
+            hook_sfx_path=settings.hook_sfx_file_path,
+            hook_sfx_volume=float((settings.hook_sfx_volume if settings.hook_sfx_volume is not None else 100.0) / 100.0),
+            original_audio_volume=float((settings.original_audio_volume if settings.original_audio_volume is not None else 100.0) / 100.0),
+            hardware_accel=settings.hardware_accel or "auto",
+            title_y_percent=settings.title_y_percent,
+            crop_x_percent=getattr(settings, "crop_x_percent", None),
+            title_x_percent=getattr(settings, "title_x_percent", 50.0),
+            progress_callback=_on_compilation_progress,
+            on_process_spawned=lambda p: register_batch_process(batch_id, p)
+        )
+        unregister_batch_process(batch_id)
+
+        if is_batch_cancelled(batch_id):
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            if out_path and os.path.exists(out_path):
+                try:
+                    os.unlink(out_path)
+                except Exception:
+                    pass
+            return
+
+        if not os.path.exists(out_path) or not is_valid_mp4(out_path):
+            raise RuntimeError("Merged MP4 file is incomplete or missing. Please retry rendering.")
+
+        clip_status["status"] = "completed"
+        clip_status["progress_percent"] = 100
+        clip_status["current_step"] = 4
+        clip_status["total_steps"] = 4
+        clip_status["step_name"] = "Selesai"
+        clip_status["step_progress"] = 100
+        clip_status["step_detail"] = "Klip berhasil dirender & disimpan!"
+        clip_status["download_url"] = f"/api/download-rendered/{out_filename}"
+        clip_status["output_path"] = out_path
+
+    except Exception as e:
+        if is_batch_cancelled(batch_id):
+            logger.info(f"Merged batch {batch_id} cancelled.")
+            clip_status["status"] = "cancelled"
+            clip_status["error_message"] = "Cancelled by user"
+            clip_status["error"] = "Cancelled by user"
+            return
+
+        logger.error(f"Error rendering merged batch {batch_id}: {e}")
+        clip_status["status"] = "error"
+        err_msg = str(e)
+        clip_status["error_message"] = err_msg
+        clip_status["error"] = err_msg
+
+    finally:
+        for p in part_paths:
+            if p and os.path.exists(p) and p != raw_merged_path:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+        if raw_merged_path and os.path.exists(raw_merged_path):
+            try:
+                os.unlink(raw_merged_path)
+            except Exception:
+                pass
+
+
+async def process_batch_rendering(batch_id: str, request: RenderBatchRequest):
+    async with _RENDER_SEMAPHORE:
+        batch = RENDER_BATCHES.get(batch_id)
+        if not batch or is_batch_cancelled(batch_id):
+            return
+
+        curr_t = asyncio.current_task()
+        if curr_t:
+            ACTIVE_BATCH_TASKS[batch_id] = curr_t
+
+        try:
+            clips = request.clips
+            settings = request.settings
+
+            # Normalize video URL for history or direct URL
+            target_url = (request.video_url or "").strip()
+            if "yt_audio_" in target_url:
+                match_yt = re.search(r'yt_audio_([a-zA-Z0-9_-]{11})', target_url)
+                if match_yt:
+                    target_url = f"https://www.youtube.com/watch?v={match_yt.group(1)}"
+            elif request.video_id and (request.video_id.startswith("gdrive_") or request.video_id.startswith("upload_")):
+                if not target_url.startswith("/api/video/"):
+                    target_url = f"/api/video/{request.video_id}"
+            elif request.video_id and is_twitch_url(request.video_id):
+                tw_info = extract_twitch_info(request.video_id)
+                target_url = get_twitch_canonical_url(tw_info) if tw_info else request.video_id
+            elif target_url and is_twitch_url(target_url):
+                tw_info = extract_twitch_info(target_url)
+                target_url = get_twitch_canonical_url(tw_info) if tw_info else target_url
+            elif not target_url:
+                if request.video_id:
+                    target_url = f"https://www.youtube.com/watch?v={request.video_id}"
+            elif not target_url.startswith("http") and not target_url.startswith("/api/video/"):
+                target_url = f"https://www.youtube.com/watch?v={target_url}"
+
+            cookies_content = getattr(request, "cookies", None)
+            is_merged = bool(settings and getattr(settings, "render_mode", "separate") == "merged")
+            if is_merged:
+                batch["current_clip_index"] = 0
+                await render_merged_batch_clips(
+                    batch_id=batch_id,
+                    clips=clips,
+                    settings=settings,
+                    target_url=target_url,
+                    transcript=request.transcript,
+                    cookies_content=cookies_content
+                )
+                batch["current_clip_index"] = 1
+            else:
+                for idx, clip in enumerate(clips):
+                    if is_batch_cancelled(batch_id):
+                        break
+                    batch["current_clip_index"] = idx
+                    await render_single_batch_clip(
+                        batch_id=batch_id,
+                        idx=idx,
+                        clip=clip,
+                        settings=settings,
+                        target_url=target_url,
+                        transcript=request.transcript,
+                        total_clips=len(clips),
+                        cookies_content=cookies_content
+                    )
+                    batch["current_clip_index"] = idx + 1
+                    if is_batch_cancelled(batch_id):
+                        break
+
+            if is_batch_cancelled(batch_id):
+                batch["overall_status"] = "cancelled"
+                batch["error_message"] = "Render process was cancelled by the user."
+                for c in batch.get("clips", []):
+                    if c.get("status") in ["pending", "downloading", "transcribing", "rendering"]:
+                        c["status"] = "cancelled"
+                        c["error_message"] = "Cancelled by user"
+                save_render_batches()
+                return
+
+            update_batch_summary_and_zip(batch_id, settings)
+        except asyncio.CancelledError:
+            logger.info(f"Batch {batch_id} cancelled via asyncio task cancellation")
+            batch["overall_status"] = "cancelled"
+            batch["error_message"] = "Render process was cancelled by the user."
+            for c in batch.get("clips", []):
+                if c.get("status") in ["pending", "downloading", "transcribing", "rendering"]:
+                    c["status"] = "cancelled"
+                    c["error_message"] = "Cancelled by user"
+            save_render_batches()
+        finally:
+            ACTIVE_BATCH_TASKS.pop(batch_id, None)
+            ACTIVE_BATCH_PROCESSES.pop(batch_id, None)
+
+
+async def process_batch_retry(batch_id: str, clip_indices: List[int]):
+    async with _RENDER_SEMAPHORE:
+        batch = RENDER_BATCHES.get(batch_id)
+        request = BATCH_REQUESTS.get(batch_id)
+        if not batch or not request:
+            logger.error(f"Cannot retry batch {batch_id}: batch or request data not found")
+            return
+
+        CANCELLED_BATCH_IDS.discard(batch_id)
+        curr_t = asyncio.current_task()
+        if curr_t:
+            ACTIVE_BATCH_TASKS[batch_id] = curr_t
+
+        try:
+            batch["overall_status"] = "running"
+            clips = request.clips
+            settings = request.settings
+            target_url = (request.video_url or "").strip()
+            if "yt_audio_" in target_url:
+                match_yt = re.search(r'yt_audio_([a-zA-Z0-9_-]{11})', target_url)
+                if match_yt:
+                    target_url = f"https://www.youtube.com/watch?v={match_yt.group(1)}"
+            elif request.video_id and (request.video_id.startswith("gdrive_") or request.video_id.startswith("upload_")):
+                if not target_url.startswith("/api/video/"):
+                    target_url = f"/api/video/{request.video_id}"
+            elif not target_url:
+                if request.video_id:
+                    target_url = f"https://www.youtube.com/watch?v={request.video_id}"
+            elif not target_url.startswith("http") and not target_url.startswith("/api/video/"):
+                target_url = f"https://www.youtube.com/watch?v={target_url}"
+
+            cookies_content = getattr(request, "cookies", None)
+            is_merged = bool(batch.get("is_merged")) or bool(settings and getattr(settings, "render_mode", "separate") == "merged")
+            if is_merged:
+                batch["current_clip_index"] = 0
+                await render_merged_batch_clips(
+                    batch_id=batch_id,
+                    clips=clips,
+                    settings=settings,
+                    target_url=target_url,
+                    transcript=request.transcript,
+                    cookies_content=cookies_content
+                )
+                batch["current_clip_index"] = 1
+            else:
+                for idx in clip_indices:
+                    if is_batch_cancelled(batch_id):
+                        break
+                    if 0 <= idx < len(clips):
+                        batch["current_clip_index"] = idx
+                        await render_single_batch_clip(
+                            batch_id=batch_id,
+                            idx=idx,
+                            clip=clips[idx],
+                            settings=settings,
+                            target_url=target_url,
+                            transcript=request.transcript,
+                            total_clips=len(clips),
+                            cookies_content=cookies_content
+                        )
+                    if is_batch_cancelled(batch_id):
+                        break
+
+            if is_batch_cancelled(batch_id):
+                batch["overall_status"] = "cancelled"
+                batch["error_message"] = "Render process was cancelled by the user."
+                for c in batch.get("clips", []):
+                    if c.get("status") in ["pending", "downloading", "transcribing", "rendering"]:
+                        c["status"] = "cancelled"
+                        c["error_message"] = "Cancelled by user"
+                save_render_batches()
+                return
+
+            update_batch_summary_and_zip(batch_id, settings)
+        except asyncio.CancelledError:
+            logger.info(f"Retry for batch {batch_id} cancelled via asyncio task cancellation")
+            batch["overall_status"] = "cancelled"
+            batch["error_message"] = "Render process was cancelled by the user."
+            for c in batch.get("clips", []):
+                if c.get("status") in ["pending", "downloading", "transcribing", "rendering"]:
+                    c["status"] = "cancelled"
+                    c["error_message"] = "Cancelled by user"
+            save_render_batches()
+        finally:
+            ACTIVE_BATCH_TASKS.pop(batch_id, None)
+            ACTIVE_BATCH_PROCESSES.pop(batch_id, None)
